@@ -42,6 +42,25 @@ function pluginDirFor(host: HostPlatform): string {
 		: path.join(".pi", "agent", "npm");
 }
 
+/**
+ * The version of a package actually on disk, or undefined when it is not
+ * installed.
+ *
+ * Both a lockfile entry and a manifest dependency are only a claim; this is the
+ * check. Removing a plugin by hand leaves its lock entry behind, and
+ * `omp plugin uninstall <name>` then refuses with "not installed", so trusting
+ * the claim would offer an update for a package that does not exist.
+ */
+async function installedVersion(
+	dir: string,
+	name: string,
+): Promise<string | undefined> {
+	const manifest = (await readJson(
+		path.join(dir, "node_modules", ...name.split("/"), "package.json"),
+	)) as InstalledPackageManifest | undefined;
+	return typeof manifest?.version === "string" ? manifest.version : undefined;
+}
+
 async function discoverOmp(home: string): Promise<PluginRecord[]> {
 	const dir = path.join(home, pluginDirFor(HostPlatform.Omp));
 	const lock = (await readJson(path.join(dir, "omp-plugins.lock.json"))) as
@@ -57,9 +76,12 @@ async function discoverOmp(home: string): Promise<PluginRecord[]> {
 		// resolved to a real install, so there is nothing to compare or update.
 		if (typeof value?.version !== "string") continue;
 
+		const installed = await installedVersion(dir, name);
+		if (installed === undefined) continue;
+
 		records.push({
 			name,
-			installed: value.version,
+			installed,
 			host: HostPlatform.Omp,
 			enabled: value.enabled !== false,
 		});
@@ -67,13 +89,16 @@ async function discoverOmp(home: string): Promise<PluginRecord[]> {
 
 	// A manifest dependency with no lockfile entry is a known edge: the host has
 	// it requested but never resolved. Report it so the gap is visible instead
-	// of surfacing later during an update.
+	// of surfacing later during an update, at its installed version rather than
+	// a fabricated 0.0.0.
 	const known = new Set(records.map((r) => r.name));
 	for (const spec of Object.keys(manifest?.dependencies ?? {})) {
 		const name = normalizeName(spec);
-		if (name && !known.has(name)) {
-			records.push({ name, installed: "0.0.0", host: HostPlatform.Omp, enabled: true });
-		}
+		if (!name || known.has(name)) continue;
+		const installed = await installedVersion(dir, name);
+		if (installed === undefined) continue;
+		known.add(name);
+		records.push({ name, installed, host: HostPlatform.Omp, enabled: true });
 	}
 
 	return records;
@@ -91,14 +116,12 @@ async function discoverPi(home: string): Promise<PluginRecord[]> {
 		const name = normalizeName(spec);
 		if (!name) continue;
 
-		// The installed version lives in the package's own manifest; a name
-		// listed in settings with nothing in node_modules is not installed.
-		const pkg = (await readJson(
-			path.join(agent, "npm", "node_modules", ...name.split("/"), "package.json"),
-		)) as InstalledPackageManifest | undefined;
-		if (typeof pkg?.version !== "string") continue;
+		// A name listed in settings with nothing in node_modules is not installed,
+		// the same rule omp's lockfile entries follow.
+		const installed = await installedVersion(path.join(agent, "npm"), name);
+		if (installed === undefined) continue;
 
-		records.push({ name, installed: pkg.version, host: HostPlatform.Pi, enabled: true });
+		records.push({ name, installed, host: HostPlatform.Pi, enabled: true });
 	}
 
 	return records;

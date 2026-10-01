@@ -42,7 +42,7 @@ The domain never imports from `extensions/`; tests inject mock implementations t
 ## Scripts
 
 ```bash
-bun test                  # 37 unit + 2 e2e tests
+bun test                  # 38 unit + 3 e2e tests
 bun test tests/e2e/       # e2e only (real host CLIs; skips if none on PATH)
 bun run typecheck         # tsc --noEmit
 bun run lint              # oxlint
@@ -85,8 +85,8 @@ Seeds `~/.omp/sandbox-maint` (or `~/.pi/sandbox-maint`):
 Sandbox ready: /home/you/.omp/sandbox-maint
   host      omp
   plugin    system-prompt-switch
-  pinned    0.9.5   (npm latest: 0.9.10)
-  seeded    16K
+  pinned    0.9.10   (npm latest: 0.10.0)
+  seeded    24K
   guard     2414824150-299  /home/you/.omp/plugins/package.json
 ```
 
@@ -114,19 +114,21 @@ bash .agents/skills/sandbox-test/scripts/sandbox-test.sh use
 Prints the launch command rather than running it, so you can edit the flags:
 
 ```
-HOME="/home/you/.omp/sandbox-maint" omp --no-session --no-skills --no-rules -e /path/to/extensions/index.ts
+HOME="/home/you/.omp/sandbox-maint" omp --no-session --no-skills --no-extensions --no-rules -e /path/to/extensions/index.ts
 ```
 
-pi has no `--no-rules`; its line omits it. The script knows which is which — do not carry one host's flags to the other.
+Two of those are load-bearing and easy to drop — `HOME` and `--no-extensions`. Both are explained below; pi has no `--no-rules`, so its line omits that one.
 
 Then, inside that session:
 
 | Step | Expected |
 |---|---|
-| session start | `1 plugin update(s) available - run /maint-updates-check to review` |
-| `/maint-updates-check` | `omp plugins (1 installed, 1 update available)` + `system-prompt-switch: 0.9.5 -> 0.9.10` |
-| `/maint-update-all` | confirm naming the delta, then `Updated 1 plugin(s)` |
+| session start | a row above the editor: `⬆️ 1 plugin update(s) available:` + the stale plugins |
+| `/maint-updates-check` | the banner clears, then `omp plugins (1 installed, 1 update available)` + `system-prompt-switch: 0.9.10 -> 0.10.0` |
+| `/maint-update-all` | confirm naming the delta, an animated progress row, then `✅ Updated 1 plugin(s)` and the reload offer |
 | decline the confirm | `Update cancelled.` and nothing written |
+
+The banner disappears on the first command or message — that is the design, not a glitch.
 
 To see what the sandbox resolved afterwards:
 
@@ -200,41 +202,76 @@ const result = await applyUpdates(records, {
 - **Ports**: `src/ports/*.port.ts` define `RegistryLookup`, `RunCommand`, and the cache read/write pair. Each is injected, so no unit test touches the network or spawns a process.
 - **Core**: `plugin-registry.ts` discovers what is installed, `version-check.ts` fills in `latest` from the registry (with cache and offline fallback), `updater.ts` plans and applies the change with backup + rollback.
 - **Extension**: `extensions/index.ts` wires the three together, registers the two commands, and fires a detached check on session start. One in-flight check is shared by the notice and both commands, so a start followed by `/maint-updates-check` does not re-query.
-- **Why hexagonal**: keeps the domain unit-testable without spawning a host. All 37 unit tests run in under 50ms and none of them touch the network.
+- **Why hexagonal**: keeps the domain unit-testable without spawning a host. All 38 unit tests run in under 50ms and none of them touch the network.
 - **Deliberate simplifications**, each marked with a `ponytail:` comment at the site: sequential registry lookups, pre-release versions compared as the plain number they lead with, and self-update excluded.
 
 ### What the update reports, and where
 
-Two constraints shaped the progress UI, both read out of the host package rather than guessed:
+Three constraints shape the UI, all read out of the host package rather than guessed.
 
-**No colour.** `ctx.ui.notify(message, type?)` accepts only `"info" | "warning" | "error"` (`dist/core/extensions/types.d.ts`). There is no colour parameter, so every notification this extension raises is painted the same grey no matter what it says. That is why the report uses a glyph per row — `⬆️` stale, `·` current — instead of a colour that cannot be set.
+**No colour.** `ctx.ui.notify(message, type?)` accepts only `"info" | "warning" | "error"` (`dist/core/extensions/types.d.ts`). There is no colour parameter, so every notification is painted the same grey regardless of content. Anything that has to be scannable therefore uses a glyph per row — `⬆️` stale, `·` current.
 
-**`setWorkingMessage()` does not work outside streaming.** It stores the message and forwards it only when `activeStatusIndicator?.kind === "working"` (`dist/modes/interactive/interactive-mode.js`), and that indicator exists only while `session.isStreaming`. A command handler runs between turns, so the message would be set and never drawn. It is also a hard no-op in RPC mode (`dist/modes/rpc/rpc-mode.js`).
+**`setWorkingMessage()` and `setWorkingIndicator()` do not work outside streaming.** Both forward only when `activeStatusIndicator?.kind === "working"` (`dist/modes/interactive/interactive-mode.js`), and that indicator exists only while `session.isStreaming`. A command handler runs between turns, so neither would ever draw. Both are also hard no-ops in RPC mode (`dist/modes/rpc/rpc-mode.js`).
 
-So progress goes through `ctx.ui.setWidget(key, lines)`, which renders above the editor and — unlike `setWorkingMessage` — is a real RPC frame, so `tests/e2e/sandbox.test.ts` can assert it. The widget is cleared in both the success and failure paths; a row left above the editor would claim work that is already over.
+**Everything transient is a widget.** `ctx.ui.setWidget(key, lines, { placement })` renders above or below the editor and is a real RPC frame, so the e2e suite can assert it.
 
-The row animates rather than sitting still. `setWorkingIndicator()` — the API that would give a real animated spinner — has the same `kind === "working"` gate as `setWorkingMessage` and is a no-op in RPC, so the host's own indicator cannot be borrowed. But `setExtensionWidget` calls `requestRender()` on every `setWidget`, so a `setInterval` re-setting the row does paint. The frames are the host's own, lifted from `examples/extensions/working-indicator.ts` in the host package, so the spinner matches what the user sees everywhere else instead of inventing a second look.
+So:
+
+- **Progress** — a widget row re-set on a `setInterval`, because `setExtensionWidget` calls `requestRender()` on every `setWidget`, which is what makes the animation paint. The frames are the host's own, lifted from `examples/extensions/working-indicator.ts`, so the spinner matches what users see everywhere else.
+- **The startup notice** — also a widget. `notify(message, "info")` is not a stacked toast: in interactive mode it lands on `showStatus()`, which mutates the *previous* status text in place when a second arrives, so two plugins notifying at startup clobber each other and the loser's message is never seen. Ordering cannot save it, because this extension's check is asynchronous. A widget is a separate render layer.
+- **`/maint-updates-check`** — deliberately keeps `notify`. There the user asked for the answer, so it belongs in the transcript where it can be read and copied.
+- **Dismissal** — the startup notice clears on any use of the session: a slash command, a typed message, or a completed update. Not on `turn_end` alone, because a slash command never ends a turn. It also expires on a deadline, because **host built-in commands fire no event an extension can observe** — there is no hook for `/plugin`, `/model` or `/help`, since extensions are notified about the agent loop rather than about the host's own commands. Without the deadline the banner would sit above the editor for the whole session after `/plugin`.
+
+Every widget is cleared on both the success and failure paths. A row left above the editor would claim work that is already over.
 
 The reload offer exists because the running session keeps the plugin code it started with. `ctx.reload()` is on `ExtensionCommandContext`, which is why that one handler takes that type rather than the base `ExtensionContext`. The dialog lists each plugin and its new version: the question being asked is "what am I about to reload", which a count alone does not answer.
 
+### Why the launch needs two flags
+
+```
+HOME="/home/you/.omp/sandbox-maint" omp --no-session --no-skills --no-extensions --no-rules -e /path/to/extensions/index.ts
+```
+
+Each flag covers a different way of hitting your real setup:
+
+| flag | what it stops |
+|---|---|
+| `HOME=…` | `/maint-update-all` touching your real plugin manifest |
+| `--no-extensions` | the **installed copy of this package** loading alongside the one under `-e` |
+
+This package is published and installed in your real profile, and it still shows the startup notice as a notification while the working tree shows it as a widget. Load both and the screen shows two notices that look identical but come from different code.
+
+Measured, one plugin stale in each profile:
+
+| | local copy (`-e`) | installed copy | notices |
+|---|---|---|---|
+| `HOME` only | loaded | loaded | 2 |
+| `--no-extensions` only | loaded | not loaded | 1 |
+| sandbox `HOME` only | loaded | not present | 1 |
+| both flags | loaded | not loaded | 1 |
+
+The flags are independent, and `sandbox-test.sh use` prints both. The e2e suite passes the same one.
+
+`cwd` is irrelevant to all of this — a subdirectory of the repo behaves the same as `/tmp`.
+
+### Discovery is checked against disk
+
+`omp-plugins.lock.json` is a record of what omp *resolved*, not proof that a package is present: removing a plugin by hand leaves its entry behind, and `omp plugin uninstall <name>` will then refuse that same name with "not installed". Trusting the lock alone would report such an entry as upgradable.
+
+`discoverOmp` therefore verifies every entry against `node_modules/<pkg>/package.json` — the same authority `omp plugin list` uses, and the same rule `discoverPi` applies to `settings.json`. A manifest dependency with no lock entry is treated the same way: reported at its installed version, or skipped when nothing is on disk.
+
 ### Each host installs with its own installer
 
-The installer choice is not a preference — it is what keeps the next check honest.
+The installer choice is what keeps the next check honest, because each host's discovery reads a different artefact.
 
-OMP discovers the installed version from `omp-plugins.lock.json`, not from `node_modules`. `bun add` rewrites `package.json` and leaves that lock on the old version, so a `bun`-based update produced exactly this:
+| Host | Discovery reads | Installer | Why |
+|---|---|---|---|
+| OMP | `omp-plugins.lock.json` | `omp plugin install <pkg>@<ver>` | the only command that rewrites the lockfile |
+| Pi | `node_modules/<pkg>/package.json` | `npm install --prefix <dir> <pkg>@<ver>` | writes straight into what pi reads |
 
-```
-/maint-updates-check  →  system-prompt-switch: 0.9.5 -> 0.9.10
-/maint-update-all     →  Updated 1 plugin(s)
-omp plugin list       →  system-prompt-switch@0.9.10     <- really installed
-/maint-updates-check  →  system-prompt-switch: 0.9.5 -> 0.9.10   <- still "stale"
-```
+`omp plugin install` takes no target flag, so it runs with `cwd` set to the plugin directory — hence the optional second argument on `RunCommand`. `INSTALL` in `src/core/updater.ts` holds both the command and a `needsCwd` flag, so a third host is one map entry.
 
-`omp plugin install <pkg>@<ver>` rewrites the lock, so it is what omp uses now. It takes no target flag, so it is run with `cwd` set to the plugin directory — hence the optional second argument on `RunCommand`.
-
-Pi reads the version out of `node_modules`, which `npm install` writes directly, so Pi never had this problem and its installer is unchanged.
-
-Both are covered: a unit test asserts the installer choice, and `tests/e2e/sandbox.test.ts` re-runs `/maint-updates-check` after an update and requires it to report `0 updates available`. That e2e assertion is the regression test for this.
+Covered by a unit test asserting the installer choice, and by the e2e suite, which re-runs `/maint-updates-check` after an update and requires `0 updates available`.
 
 ---
 
@@ -269,7 +306,7 @@ bash .agents/skills/bump-version/scripts/bump-version.sh --minor
 npm publish --access public
 ```
 
-**There is no `.npmignore`.** `npm pack` falls back to `.gitignore`, which does not exclude `.agents/` or `.github/`, so skills, workflows and `bun.lock` currently ship in the tarball. Adding one is the cheap fix; `tests/` stays in, so downstream contributors can run `bun test` immediately.
+**`.npmignore` keeps the tarball lean.** Without it, `npm pack` falls back to `.gitignore`, which does not exclude `.agents/` or `.github/` — so all seven skills and the workflows would ship. `tests/` and `assets/` stay in: downstream contributors can run `bun test`, and the README image URLs resolve from the tarball.
 
 Smoke test the install:
 

@@ -29,7 +29,12 @@ async function writeJson(file: string, value: unknown): Promise<void> {
 	await fs.writeFile(file, JSON.stringify(value, null, 2));
 }
 
-/** Lay down an omp plugin dir and return its root. */
+/**
+ * Lay down an omp plugin dir and return its root.
+ *
+ * node_modules is seeded for every locked plugin, because discovery checks
+ * there: a lock entry with nothing installed is a leftover, not a plugin.
+ */
 async function makeOmpHome(lock: Record<string, { version: string; enabled: boolean }>): Promise<string> {
 	const home = path.join(tmp, "omp-home");
 	const dir = path.join(home, ".omp", "plugins");
@@ -42,6 +47,12 @@ async function makeOmpHome(lock: Record<string, { version: string; enabled: bool
 		},
 	});
 	await writeJson(path.join(dir, "omp-plugins.lock.json"), { plugins: lock });
+	for (const [name, entry] of Object.entries(lock)) {
+		await writeJson(path.join(dir, "node_modules", ...name.split("/"), "package.json"), {
+			name,
+			version: entry.version,
+		});
+	}
 	return home;
 }
 
@@ -93,6 +104,39 @@ describe("discoverPlugins", () => {
 		// A name must never leak the "npm:" scheme or a @version pin, or the
 		// registry lookup below would request a package that does not exist.
 		expect(records.map((r) => r.name).sort()).toEqual(["@scope/pkg", "plain-pkg"]);
+	});
+
+	it("ignores a lock entry whose package is not installed, so a leftover is not reported as upgradable", async () => {
+		const home = await makeOmpHome({
+			"plain-pkg": { version: "0.1.3", enabled: true },
+		});
+		const dir = path.join(home, ".omp", "plugins");
+		// The real shape of this bug: a plugin removed by hand leaves its lock
+		// entry behind, and omp plugin uninstall then refuses to remove a name it
+		// does not consider installed. Reporting it as upgradable is worse than
+		// silent - the user is told to run /maint-update-all for a package that
+		// does not exist.
+		//
+		// The manifest is rewritten too, so the only entry under test is the ghost:
+		// otherwise @scope/pkg, which makeOmpHome requests but never installs,
+		// arrives through the unresolved-dependency path instead.
+		await writeJson(path.join(dir, "package.json"), {
+			name: "omp-plugins",
+			private: true,
+			dependencies: { "plain-pkg": "npm:plain-pkg@0.1.3", "ghost-pkg": "npm:ghost-pkg@0.2.1" },
+		});
+		await writeJson(path.join(dir, "omp-plugins.lock.json"), {
+			plugins: {
+				"plain-pkg": { version: "0.1.3", enabled: true },
+				"ghost-pkg": { version: "0.2.1", enabled: true },
+			},
+		});
+
+		const records = await discoverPlugins(HostPlatform.Omp, home);
+
+		// ghost-pkg is in the manifest but has no node_modules, so it is not
+		// installed at all - not stale, not upgradable, just absent.
+		expect(records.map((r) => r.name)).toEqual(["plain-pkg"]);
 	});
 
 	it("reads pi plugins from settings.json plus the installed node_modules versions", async () => {

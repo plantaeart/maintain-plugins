@@ -58,6 +58,16 @@ describe("session-start notice", () => {
 					settings: {},
 				}),
 			);
+			// node_modules as well: discovery treats a lock entry with nothing
+			// installed as a leftover and skips it, so without this the sandbox
+			// reports nothing and the notice never appears.
+			for (const name of STALE) {
+				await fs.mkdir(path.join(dir, "node_modules", name), { recursive: true });
+				await fs.writeFile(
+					path.join(dir, "node_modules", name, "package.json"),
+					JSON.stringify({ name, version: "1.0.0" }),
+				);
+			}
 			// Same credential-free model declaration the sandbox skill seeds, so
 			// the host boots without an API key.
 			await fs.mkdir(path.join(home, ".omp", "agent"), { recursive: true });
@@ -81,8 +91,24 @@ describe("session-start notice", () => {
 
 			const child = spawn(
 				"omp",
-				["--no-session", "--no-skills", "--no-rules", "--mode", "rpc", "-e", path.join(REPO_ROOT, "extensions/index.ts")],
-				{ cwd: REPO_ROOT, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+				[
+					"--no-session",
+					"--no-skills",
+					"--no-rules",
+					// Stops this package's installed copy from loading alongside the one
+					// under test. See the same flag in sandbox.test.ts.
+					"--no-extensions",
+					"--mode",
+					"rpc",
+					"-e",
+					path.join(REPO_ROOT, "extensions/index.ts"),
+				],
+				{
+					// HOME isolates; os.tmpdir() is tidiness. See sandbox.test.ts.
+					cwd: os.tmpdir(),
+					env: { ...process.env, HOME: home },
+					stdio: ["pipe", "pipe", "pipe"],
+				},
 			);
 
 			const notice = await new Promise<string>((resolve, reject) => {
@@ -97,16 +123,23 @@ describe("session-start notice", () => {
 					buffer = lines.pop() ?? "";
 					for (const line of lines) {
 						if (!line.trim()) continue;
-						let frame: { type?: string; method?: string; message?: string };
+						let frame: { type?: string; method?: string; widgetLines?: string[] };
 						try {
 							frame = JSON.parse(line);
 						} catch {
 							continue;
 						}
-						if (frame.type === "extension_ui_request" && frame.method === "notify" && /plugin update/.test(frame.message ?? "")) {
+						// The notice is a widget, not a notify: notify("info") lands on
+						// a status line the host replaces, so another plugin notifying at
+						// startup can silently remove this one.
+						if (
+							frame.type === "extension_ui_request" &&
+							frame.method === "setWidget" &&
+							(frame.widgetLines ?? []).some((line) => /plugin update/.test(line))
+						) {
 							clearTimeout(timer);
 							child.kill("SIGTERM");
-							resolve(frame.message ?? "");
+							resolve((frame.widgetLines ?? []).join("\n"));
 						}
 					}
 				});

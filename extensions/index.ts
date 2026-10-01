@@ -21,6 +21,31 @@ import {
 const PROGRESS_WIDGET_KEY = "maintain-plugins-progress";
 
 /**
+ * Widget slot for the session-start notice; cleared on the first message.
+ *
+ * A widget, not ctx.ui.notify(): notify("info") lands on a status line that the
+ * host *replaces* rather than appends, so two plugins notifying at startup
+ * silently clobber each other and the loser's message is simply never seen.
+ * This extension's check is asynchronous, so it cannot win that race by
+ * ordering alone. A widget is its own render layer and cannot be overwritten.
+ */
+const NOTICE_WIDGET_KEY = "maintain-plugins-notice";
+
+/**
+ * How long the notice may stay up when nothing observable dismisses it.
+ *
+ * Host built-in commands — `/plugin`, `/model`, `/help` — fire no event an
+ * extension can observe. There is no hook for them: extensions are notified
+ * about the agent loop, not about the host's own commands. Without a deadline
+ * the banner would sit above the editor for the whole session after `/plugin`.
+ *
+ * ponytail: 20s, not a configurable setting. It only has to outlive the
+ * startup burst long enough to be read; if it ever proves too short, the
+ * dismissal on the first message already covers the common case.
+ */
+const NOTICE_TTL_MS = 20_000;
+
+/**
  * The host's own spinner frames, reused so the progress row matches it.
  *
  * From `examples/extensions/working-indicator.ts` in the host package: the
@@ -59,23 +84,28 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		return inFlight;
 	}
 
+	/** `  ⬆️ name: installed -> latest` — shared by the notice and both dialogs. */
+	function staleRow(update: Pick<PluginRecord, "name" | "installed" | "latest">): string {
+		return `  ⬆️ ${update.name}: ${update.installed} -> ${update.latest}`;
+	}
+
 	function formatReport(checked: PluginRecord[]): string {
 		if (checked.length === 0) {
 			return `No ${host} plugins found under ${pluginDir}`;
 		}
-		const stale = checked.filter(isUpdateAvailable);
+		const stale = new Set(checked.filter(isUpdateAvailable));
 		const lines = checked.map((record) => {
 			// A marker per line rather than a colour: ctx.ui.notify() takes only
 			// info|warning|error, so the host paints every one of these the same
 			// grey. A glyph is the only way to make a stale plugin scannable.
-			const marker = isUpdateAvailable(record) ? "⬆️" : "·";
-			const target = isUpdateAvailable(record) ? ` -> ${record.latest}` : "";
+			const isStale = stale.has(record);
+			const target = isStale ? ` -> ${record.latest}` : "";
 			const flag = record.enabled ? "" : " (disabled)";
-			const state = isUpdateAvailable(record) ? "update available" : "current";
-			return `  ${marker} ${record.name}: ${record.installed}${target}  [${state}${flag}]`;
+			const state = isStale ? "update available" : "current";
+			return `  ${isStale ? "⬆️" : "·"} ${record.name}: ${record.installed}${target}  [${state}${flag}]`;
 		});
-		const header = `${host} plugins (${checked.length} installed, ${stale.length} update${
-			stale.length === 1 ? "" : "s"
+		const header = `${host} plugins (${checked.length} installed, ${stale.size} update${
+			stale.size === 1 ? "" : "s"
 		} available)`;
 		return [header, ...lines].join("\n");
 	}
@@ -85,19 +115,35 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 	 * gets a summary rather than a wall of text at session start.
 	 */
 	function formatStale(checked: PluginRecord[], cap = 4): string {
-		const rows = checked
-			.filter(isUpdateAvailable)
-			.map((record) => `  ⬆️ ${record.name}: ${record.installed} -> ${record.latest}`);
+		const rows = checked.filter(isUpdateAvailable).map(staleRow);
 		return rows.length > cap
 			? `${rows.slice(0, cap).join("\n")}\n  … and ${rows.length - cap} more`
 			: rows.join("\n");
 	}
+
+	// The notice has done its job as soon as the user acts on the session, so it
+	// leaves on any use of it: a slash command, a typed message, or a completed
+	// update. turn_end only covers messages, and a command never ends a turn, so
+	// waiting for it alone left the banner up for the rest of the session.
+	// The expiry is cancelled here too, so an explicit dismissal does not race a
+	// later clear of a widget that has since been set again.
+	let expiry: NodeJS.Timeout | undefined;
+	const dismissNotice = (ctx: ExtensionContext): void => {
+		if (expiry !== undefined) {
+			clearTimeout(expiry);
+			expiry = undefined;
+		}
+		ctx.ui.setWidget(NOTICE_WIDGET_KEY, undefined);
+	};
 
 	// --- Commands ---
 
 	pi.registerCommand(ExtensionCommand.UPDATES_CHECK, {
 		description: EXTENSION_COMMAND_CATALOG[ExtensionCommand.UPDATES_CHECK].description,
 		handler: async (_args: string, ctx: ExtensionContext) => {
+			// The banner is replaced by this report, so it goes first rather than
+			// sitting above the editor while the answer is already on screen.
+			dismissNotice(ctx);
 			const checked = await records();
 			ctx.ui.notify(formatReport(checked), "info");
 		},
@@ -117,9 +163,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// Every version delta is shown before anything is written: this
 			// rewrites the host's plugin manifest, and a plugin pinned for a
 			// reason is the user's call, not this plugin's.
-			const summary = plan.updates
-				.map((u) => `  ⬆️ ${u.name}: ${u.installed} -> ${u.latest}`)
-				.join("\n");
+			const summary = plan.updates.map(staleRow).join("\n");
 			const confirmed = await ctx.ui.confirm(
 				"Update all plugins?",
 				`${plan.updates.length} plugin(s) will be updated:\n${summary}\n\nA backup of the manifest is kept and restored automatically if an install fails.`,
@@ -134,12 +178,10 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// handler runs between turns. An install produces no output of its
 			// own, so without this a long run is an unexplained pause.
 			//
-			// The row is re-set on a timer so the spinner animates: setWidget
-			// calls requestRender() on every call, and a plain one-shot line
-			// looks frozen next to the host's own animated spinner.
-			// The text is stored unprefixed and the glyph is added at paint time.
-			// Feeding paint() its own output back would prepend a second glyph on
-			// every tick and grow the row by a character per frame.
+			// The row is re-set on a timer so the spinner animates, because
+			// setWidget calls requestRender() on every call. `text` holds the line
+			// unprefixed and the glyph is added at paint time — feeding paint() its
+			// own output back would prepend a second glyph every tick.
 			let frame = 0;
 			let text = `⬆️ Updating 0/${plan.updates.length}…`;
 			const paint = () => {
@@ -172,6 +214,10 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// The cached versions are now stale in the other direction; drop them
 			// so the next check reflects what is actually installed.
 			inFlight = undefined;
+			// The startup notice listed exactly what was just applied, so it is now
+			// stale itself; leaving it would claim updates that no longer exist.
+			// dismissNotice, not a bare clear, so the expiry is cancelled with it.
+			dismissNotice(ctx);
 			ctx.ui.notify(
 				`✅ Updated ${result.applied.length} plugin(s):\n` +
 					result.applied.map((u) => `  ⬆️ ${u.name} -> ${u.latest}`).join("\n"),
@@ -183,7 +229,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// reload picks up what was just written to disk. The dialog names each
 			// plugin, because the whole point of the question is "what am I about
 			// to reload", and a bare count answers nothing.
-			const reloading = result.applied.map((u) => `  ⬆️ ${u.name} ${u.installed} -> ${u.latest}`).join("\n");
+			const reloading = result.applied.map(staleRow).join("\n");
 			const reloadNow = await ctx.ui.confirm(
 				"Reload now?",
 				`${result.applied.length} plugin(s) updated. Reloading activates:\n${reloading}\n\n` +
@@ -207,16 +253,29 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 				// Names the stale plugins rather than only counting them: this is the
 				// one message shown without the user asking for it, so a bare
 				// "1 update available" costs a follow-up command to become useful.
-				ctx.ui.notify(
-					`⬆️ ${stale.length} plugin update(s) available:\n${formatStale(checked)}\n` +
-						`Run /${ExtensionCommand.UPDATES_CHECK} for the full list.`,
-					"info",
-				);
+				ctx.ui.setWidget(NOTICE_WIDGET_KEY, [
+					`⬆️ ${stale.length} plugin update(s) available:`,
+					formatStale(checked),
+					`Run /${ExtensionCommand.UPDATES_CHECK} for the full list.`,
+				]);
+				// An expiry, because not every way of using the session is visible
+				// to this extension. Host built-in commands (/plugin, /model, /help)
+				// fire no event an extension can observe - there is no hook for them -
+				// so the dismissal below cannot catch those, and without a deadline
+				// the banner would sit above the editor for the whole session.
+				expiry = setTimeout(() => {
+					expiry = undefined;
+					dismissNotice(ctx);
+				}, NOTICE_TTL_MS);
 			})
 			.catch(() => {
 				// Never surface a check failure on its own; the command is the
 				// place where an error is actionable.
 			});
+	});
+
+	pi.on(ExtensionEventType.TurnEnd, (_event: unknown, ctx: ExtensionContext) => {
+		dismissNotice(ctx);
 	});
 }
 

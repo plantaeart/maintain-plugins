@@ -29,4 +29,6 @@ export const EXTENSION_COMMAND_CATALOG: Record<
 /** Lifecycle event names shared with the host. */
 export enum ExtensionEventType {
 	SessionStart = "session_start",
+	/** Fired at the end of each turn; the first one means the user has typed. */
+	TurnEnd = "turn_end",
 }

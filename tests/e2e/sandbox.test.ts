@@ -329,8 +329,9 @@ describe("sandbox e2e", () => {
 					// The startup notice is a widget, not a notify: notify("info")
 					// lands on a replaceable status line that another plugin can clobber,
 					// and this check is async so it cannot win that race by ordering.
-					const notice = await session.widget(/plugin update\(s\) available/, "the startup notice");
-					expect(notice).toContain("⬆️ 1 plugin update(s) available:");
+					// Match the stable part of the title, not its exact wording.
+					const notice = await session.widget(/plugin update.* available/, "the startup notice");
+					expect(notice).toContain("⬆️ 1 plugin update available");
 					expect(notice).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
 					expect(notice).toContain("Run /maint-updates-check for the full list.");
 

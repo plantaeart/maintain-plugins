@@ -1,0 +1,25 @@
+# Build / lockfiles
+node_modules/
+*.tsbuildinfo
+
+# Both lockfiles — npm will regenerate
+package-lock.json
+bun.lock
+
+# Agent scratch / IDE noise
+.agents/
+
+# VCS
+.git/
+.gitignore
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Tests are kept (npm install for downstream dev tooling); only drop local artifacts
+coverage/

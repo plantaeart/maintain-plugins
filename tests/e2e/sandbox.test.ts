@@ -31,6 +31,8 @@ const SANDBOX_SCRIPT = path.join(REPO_ROOT, ".agents/skills/sandbox-test/scripts
 /** The plugin the sandbox seeds, and the version it is pinned below. */
 const PACKAGE = "system-prompt-switch";
 const PIN = "0.9.5";
+/** What the seeded check cache says is newest, so no lookup is needed. */
+const LATEST = "0.10.0";
 
 interface UiFrame {
 	type: string;
@@ -283,6 +285,84 @@ async function sha256(file: string): Promise<string> {
 	}
 }
 
+/**
+ * Lay down a plugin that the host will discover as installed, without npm.
+ *
+ * Mirrors the real layout of each host: omp reads a lockfile entry and pi reads
+ * node_modules, and discovery only reports a plugin that is present on disk.
+ * Enough for a test about removing one, and no registry involved.
+ */
+async function seedInstalledPlugin(
+	home: string,
+	host: "omp" | "pi",
+	name: string,
+	version: string,
+): Promise<void> {
+	// Without a model the host refuses to start, and the extension never loads.
+	// `auth: none` is a declaration, not a credential: no request is ever made.
+	await fs.mkdir(path.join(home, `.${host}`, "agent"), { recursive: true });
+	await fs.writeFile(path.join(home, `.${host}`, "agent", "config.yml"), "setupVersion: 2\n");
+	await fs.writeFile(
+		path.join(home, `.${host}`, "agent", "models.yml"),
+		[
+			"providers:",
+			"  - id: sandbox",
+			"    name: Sandbox",
+			"    api: openai-completions",
+			"    baseUrl: https://api.openai.com/v1",
+			"    auth: none",
+			"    models:",
+			"      - id: sandbox-model",
+			"        name: Sandbox Model",
+			"",
+		].join("\n"),
+	);
+
+	if (host === "omp") {
+		const dir = path.join(home, ".omp", "plugins");
+		await fs.mkdir(path.join(dir, "node_modules", name), { recursive: true });
+		await fs.writeFile(
+			path.join(dir, "package.json"),
+			JSON.stringify({ name: "omp-plugins", private: true, dependencies: { [name]: `npm:${name}@${version}` } }),
+		);
+		await fs.writeFile(
+			path.join(dir, "omp-plugins.lock.json"),
+			JSON.stringify({ plugins: { [name]: { version, enabled: true } }, settings: {} }),
+		);
+		await fs.writeFile(
+			path.join(dir, "node_modules", name, "package.json"),
+			JSON.stringify({ name, version }),
+		);
+		return;
+	}
+	const agent = path.join(home, ".pi", "agent");
+	await fs.mkdir(path.join(agent, "npm", "node_modules", name), { recursive: true });
+	await fs.writeFile(path.join(agent, "settings.json"), JSON.stringify({ packages: [`npm:${name}`] }));
+	await fs.writeFile(
+		path.join(agent, "npm", "package.json"),
+		JSON.stringify({ name: "pi-npm", private: true, dependencies: { [name]: version } }),
+	);
+	await fs.writeFile(
+		path.join(agent, "npm", "node_modules", name, "package.json"),
+		JSON.stringify({ name, version }),
+	);
+}
+
+/**
+ * Pretend a registry check just ran, so the version comparison costs no
+ * network round trip.
+ *
+ * The update test below genuinely installs, and cannot avoid that. It can avoid
+ * the *lookup* on top of it, which is the part that turned a slow runner into a
+ * 120s timeout. Seeding the cache keeps the installed version the only variable,
+ * so the assertion stays exact rather than "whatever npm says today".
+ */
+async function seedCheckCache(home: string, host: "omp" | "pi", latest: Record<string, string>): Promise<void> {
+	const dir = path.join(home, `.${host}`, "agent", "state", "maintain-plugins");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(path.join(dir, "check.json"), JSON.stringify({ checkedAt: Date.now(), latest }));
+}
+
 describe("sandbox e2e", () => {
 	for (const testCase of HOSTS) {
 		describe(testCase.host, () => {
@@ -318,6 +398,11 @@ describe("sandbox e2e", () => {
 					{ cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
 				);
 				if (seeded.exitCode !== 0) throw new Error(`sandbox init: ${seeded.stderr.toString()}`);
+				// The install below is real and unavoidable, so the version it resolves
+				// to is not left to a registry call: seeding the cache keeps the
+				// assertion exact and removes the request that a slow runner would
+				// otherwise spend the frame budget on.
+				await seedCheckCache(sandbox, testCase.host, { [PACKAGE]: LATEST });
 			});
 
 			afterAll(async () => {
@@ -408,6 +493,17 @@ describe("sandbox e2e", () => {
 					expect(updated).not.toContain(`@${PIN}`);
 					expect(await sha256(testCase.realManifest())).toBe(realBefore);
 
+					// The manifest is not the install. Check what the package manager
+					// actually put on disk, at the version the cache promised, so a
+					// "success" that installed nothing cannot pass.
+					const installedPkg = path.join(
+						testCase.pluginDir(sandbox),
+						"node_modules",
+						...PACKAGE.split("/"),
+						"package.json",
+					);
+					expect(JSON.parse(await fs.readFile(installedPkg, "utf8")).version).toBe(LATEST);
+
 					// The regression this sandbox was built for: the host
 					// discovers omp plugins from omp-plugins.lock.json, so an
 					// install that skips the lock leaves the next check reporting
@@ -432,12 +528,16 @@ describe("sandbox e2e", () => {
 					}
 					// Its own sandbox: this one deletes the plugin the other test
 					// asserts on.
+					//
+					// Seeded by hand rather than through `sandbox-test.sh init`,
+					// which resolves the pin from npm. Uninstalling needs a plugin
+					// that is *listed and installed*, not one with a newer version, so
+					// this test takes a stub manifest and never touches the registry.
+					// That is what made it the slow one: a cold runner spends the
+					// frame budget on a network round trip.
 					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-uninstall-"));
 					registerTestSandbox(dir);
-					Bun.spawnSync(
-						["bash", SANDBOX_SCRIPT, "init", "--host", testCase.host, "--package", PACKAGE, "--pin", PIN, "--path", dir],
-						{ cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
-					);
+					await seedInstalledPlugin(dir, testCase.host, PACKAGE, PIN);
 					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet]);
 					try {
 						const realBefore = await sha256(testCase.realManifest());

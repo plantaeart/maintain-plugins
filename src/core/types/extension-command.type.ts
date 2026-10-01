@@ -2,6 +2,7 @@
 export enum ExtensionCommand {
 	UPDATES_CHECK = "maint-updates-check",
 	UPDATE_ALL = "maint-update-all",
+	UNINSTALL_PLUGIN = "maint-uninstall-plugin",
 }
 
 export interface ExtensionCommandMetadata {
@@ -23,6 +24,11 @@ export const EXTENSION_COMMAND_CATALOG: Record<
 		command: ExtensionCommand.UPDATE_ALL,
 		description: "Update every stale plugin to its latest version",
 		usage: "/maint-update-all",
+	},
+	[ExtensionCommand.UNINSTALL_PLUGIN]: {
+		command: ExtensionCommand.UNINSTALL_PLUGIN,
+		description: "Remove an installed plugin, after confirming",
+		usage: "/maint-uninstall-plugin",
 	},
 };
 

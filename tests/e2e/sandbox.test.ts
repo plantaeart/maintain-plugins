@@ -38,6 +38,7 @@ interface UiFrame {
 	method?: string;
 	message?: string;
 	title?: string;
+	options?: string[];
 	/** setWidget carries either lines or nothing; nothing means "clear it". */
 	widgetKey?: string;
 	widgetLines?: string[];
@@ -177,6 +178,20 @@ class HostSession {
 		const message = frame.message ?? "";
 		this.#notifies.push(message);
 		return message;
+	}
+
+	/** Answer the next picker; resolves with the chosen option. */
+	async select(pick: (options: string[]) => string, what: string): Promise<string> {
+		const frame = await this.#next(
+			(f) => f.type === "extension_ui_request" && f.method === "select",
+			what,
+		);
+		const options = frame.options ?? [];
+		const choice = pick(options);
+		this.#child.stdin.write(
+			`${JSON.stringify({ type: "extension_ui_response", id: frame.id, value: choice })}\n`,
+		);
+		return choice;
 	}
 
 	/** Answer the next confirmation dialog; resolves with its title. */
@@ -404,6 +419,54 @@ describe("sandbox e2e", () => {
 					);
 					expect(recheck).toContain("0 updates available");
 					expect(recheck).not.toContain(`${PACKAGE}: ${PIN} ->`);
+				},
+				180_000,
+			);
+
+			it(
+				"removes a plugin only after an explicit confirmation",
+				async () => {
+					if (sandbox === "") {
+						console.warn(`skipping ${testCase.host} e2e: '${testCase.bin}' is not on PATH`);
+						return;
+					}
+					// Its own sandbox: this one deletes the plugin the other test
+					// asserts on.
+					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-uninstall-"));
+					registerTestSandbox(dir);
+					Bun.spawnSync(
+						["bash", SANDBOX_SCRIPT, "init", "--host", testCase.host, "--package", PACKAGE, "--pin", PIN, "--path", dir],
+						{ cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
+					);
+					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet]);
+					try {
+						const realBefore = await sha256(testCase.realManifest());
+						const manifestPath = path.join(testCase.pluginDir(dir), "package.json");
+
+						fresh.run("/maint-uninstall-plugin");
+						// Offered as a list of what is installed, each with its version.
+						const chosen = await fresh.select((o) => o[0], "the plugin picker");
+						expect(chosen).toBe(`${PACKAGE}@${PIN}`);
+
+						// Declining must leave the manifest byte-identical: this is the
+						// only command here that destroys something.
+						expect(await fresh.confirm(false, "the removal confirmation")).toBe(
+							`Remove ${PACKAGE}@${PIN}?`,
+						);
+						await fresh.notify(/nothing was removed/, "the cancellation");
+						expect(await fs.readFile(manifestPath, "utf8")).toContain(PACKAGE);
+
+						fresh.run("/maint-uninstall-plugin");
+						await fresh.select((o) => o[0], "the plugin picker, second time");
+						await fresh.confirm(true, "the removal confirmation, second time");
+						await fresh.notify(new RegExp(`Removed ${PACKAGE}`), "the removal");
+
+						// Gone from the manifest, and the real profile untouched.
+						expect(await fs.readFile(manifestPath, "utf8")).not.toContain(PACKAGE);
+						expect(await sha256(testCase.realManifest())).toBe(realBefore);
+					} finally {
+						fresh.close();
+					}
 				},
 				180_000,
 			);

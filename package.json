@@ -1,6 +1,6 @@
 {
   "name": "maintain-plugins",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi extension that checks installed plugin versions against npm and updates them safely on request",
   "type": "module",
   "main": "extensions/index.ts",

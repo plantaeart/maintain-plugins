@@ -33,6 +33,7 @@ That's it. The extension registers on next session start. Works in both Pi and O
 - **Per-plugin progress** — while the batch installs, an animated row above the editor reads `⠹ ⬆️ Updating 2/5 — <name>` and disappears when the run ends. Installing produces no output of its own, so without it a long update is an unexplained pause.
 - **Reload offered, not forced** — after a successful update the session is still running the old plugin code, so the extension asks whether to reload now, listing each plugin and the version it would activate. Declining is fine; it names `/reload-plugins` (OMP) or `/reload` (Pi) for later.
 - **Manifest backup and automatic rollback** — the host's plugin `package.json` is copied before the pin is rewritten and restored if the install fails, so a pin for a version that never installed cannot be left behind.
+- **Two kinds of failure, told apart** — an update can fail because the package would not install, or because it installed and the host then could not load it. The second is usually a plugin using a host API that only exists in the *other* host — pi's `registerEntryRenderer` does not exist in omp, for instance. The failure notice says which happened, and points at `/maint-uninstall-plugin` when removal is the fix.
 - **Cached checks** — registry results are cached for 6 hours per host, so a session start does not make one request per plugin. If the registry is unreachable, the last known versions are reported rather than nothing, and a total outage does not reset the cache clock.
 - **Disabled plugins are reported, never updated** — a plugin the host has switched off shows up as `(disabled)` and is skipped.
 - **No downgrade** — a version is only treated as newer when it genuinely is; a registry that answers with an older number leaves the plugin alone.
@@ -45,6 +46,7 @@ That's it. The extension registers on next session start. Works in both Pi and O
 |---|---|
 | `/maint-updates-check` | Check installed plugin versions against npm (read-only) |
 | `/maint-update-all` | Update every stale plugin, after showing the full delta and confirming |
+| `/maint-uninstall-plugin` | Remove an installed plugin: pick from a list, then confirm |
 
 ## Demos
 
@@ -77,7 +79,7 @@ Each host is updated through **its own installer**, because that is what keeps t
 
 ## Safety notes
 
-- **Nothing happens without a confirmation.** `/maint-updates-check` is read-only; `/maint-update-all` shows every delta and asks.
+- **Nothing happens without a confirmation.** `/maint-updates-check` is read-only; `/maint-update-all` shows every delta and asks; `/maint-uninstall-plugin` lists what is installed, then asks a second time before deleting anything. Removal is the one irreversible action here and is **not** backed up by the manifest copy described above — reinstalling from npm is the way back.
 - **A plugin pinned for a reason is your call.** The extension reports; it does not decide.
 - **Self-update is out of scope.** A plugin cannot meaningfully roll back the copy of itself that is currently executing, so `maintain-plugins` never updates itself.
 - **Test with a sandbox `HOME`, not `--profile`.** See [README.dev.md](./README.dev.md#testing-locally). Under `omp --profile <name>` the host reads `~/.omp/profiles/<name>/plugins` while this extension still targets `~/.omp/plugins`, so a test run in a profile would edit your real manifest.

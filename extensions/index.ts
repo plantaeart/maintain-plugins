@@ -7,6 +7,7 @@ import type {
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { discoverPlugins } from "../src/core/plugin-registry";
 import { cachePathFor, detectHost, pluginDirFor } from "../src/core/paths";
+import { uninstallPlugin } from "../src/core/uninstall";
 import { applyUpdates, buildUpdatePlan } from "../src/core/updater";
 import { DEFAULT_TTL_MS, checkVersions } from "../src/core/version-check";
 import { lookupNpmVersion } from "../src/ports/registry.port";
@@ -236,8 +237,15 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 
 			if (!result.ok) {
 				// The manifest has already been rolled back by applyUpdates.
+				// A load failure is the actionable case: the install worked, the
+				// host cannot run the new code, and the way out is to remove it.
+				const unloadable = result.failures.filter((f) => f.kind === "load-failed");
+				const hint =
+					unloadable.length > 0
+						? `\n\nRun /${ExtensionCommand.UNINSTALL_PLUGIN} to remove the plugins that can't work with ${host} anymore.`
+						: "";
 				ctx.ui.notify(
-					`❌ Update failed, plugin manifest restored:\n${result.errors.join("\n")}`,
+					`❌ Update failed, plugin manifest restored:\n${result.errors.join("\n")}${hint}`,
 					"error",
 				);
 				return;
@@ -270,6 +278,43 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			if (reloadNow) {
 				await ctx.reload();
 			}
+		},
+	});
+
+	pi.registerCommand(ExtensionCommand.UNINSTALL_PLUGIN, {
+		description: EXTENSION_COMMAND_CATALOG[ExtensionCommand.UNINSTALL_PLUGIN].description,
+		handler: async (_args: string, ctx: ExtensionContext) => {
+			// Refresh first: the list must reflect what is installed now, not what
+			// was found at startup.
+			const installed = await discoverPlugins(host);
+			if (installed.length === 0) {
+				ctx.ui.notify(`No ${host} plugins found under ${pluginDir}.`, "info");
+				return;
+			}
+
+			// Cancelling the picker is the answer, so there is no separate "never mind".
+			const picked = await ctx.ui.select(
+				"Remove which plugin?",
+				installed.map((record) => `${record.name}@${record.installed}`),
+			);
+			if (picked === undefined) return;
+
+			// Deleting is not undoable from here, so it always takes a second,
+			// explicit step. Nothing is removed on a single keypress.
+			const confirmed = await ctx.ui.confirm(
+				`Remove ${picked}?`,
+				`This runs the host's own uninstaller, which removes ${picked} from the plugin ` +
+					`manifest, the lockfile and node_modules.\n\nIt is not backed up here.`,
+			);
+			if (!confirmed) {
+				ctx.ui.notify("Cancelled; nothing was removed.", "info");
+				return;
+			}
+
+			const result = await uninstallPlugin(host, picked);
+			ctx.ui.notify(result.message, result.ok ? "info" : "error");
+			// The plugin is gone, so anything cached about it is now wrong.
+			if (result.ok) inFlight = undefined;
 		},
 	});
 

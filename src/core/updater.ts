@@ -1,11 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { runCommand, type RunCommand } from "../ports/process.port";
+import { quote, runCommand, type RunCommand } from "../ports/process.port";
 import { HostPlatform } from "./types/host-platform.type";
 import { isUpdateAvailable, type PluginRecord } from "./types/plugin-record.type";
 import type {
 	BackupEntry,
 	PluginUpdate,
+	UpdateFailure,
+	UpdateFailureKind,
 	UpdatePlan,
 	UpdateResult,
 } from "./types/update-plan.type";
@@ -48,10 +50,6 @@ const INSTALL: Record<
 		needsCwd: false,
 	},
 };
-
-function quote(value: string): string {
-	return /[\s"'|&;<>()$`]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
-}
 
 export function buildUpdatePlan(records: PluginRecord[]): UpdatePlan {
 	const updates: PluginUpdate[] = [];
@@ -127,23 +125,52 @@ async function restoreEntries(entries: BackupEntry[]): Promise<void> {
 	}
 }
 
+/**
+ * Tell a failed install apart from a plugin that installed but will not load.
+ *
+ * The second case is not rare and not the user's fault: a plugin can start
+ * using a host API that only exists in the other host, and the package manager
+ * is perfectly happy about it. Reporting that as "install failed" sends them
+ * looking at npm for a problem that is not there.
+ */
+function classifyFailure(stderr: string | undefined): UpdateFailureKind {
+	if (stderr && /Failed to load extension|is not a function/.test(stderr)) return "load-failed";
+	return "install-failed";
+}
+
+/** The lines that actually explain the failure, out of whatever the host said. */
+function failureDetail(stderr: string | undefined): string {
+	if (!stderr) return "";
+	return stderr
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => /Failed to load extension|is not a function|Error:/i.test(line))
+		.slice(0, 2)
+		.join(" ");
+}
+
 export async function applyUpdates(
 	records: PluginRecord[],
 	options: ApplyOptions,
 ): Promise<UpdateResult> {
 	const plan = buildUpdatePlan(records);
 	if (plan.updates.length === 0) {
-		return { ok: true, applied: [], backups: [], errors: [] };
+		return { ok: true, applied: [], backups: [], errors: [], failures: [] };
 	}
 
 	const run = options.run ?? runCommand;
 	const backups: BackupEntry[] = [];
-	const errors: string[] = [];
+	const failures: UpdateFailure[] = [];
 
 	for (const [host, updates] of plan.byHost) {
 		const dir = options.pluginDirs.get(host);
 		if (!dir) {
-			errors.push(`${host}: plugin directory not resolved, skipped ${updates.length} update(s)`);
+			failures.push({
+				name: updates.map((u) => u.name).join(", "),
+				kind: "install-failed",
+				host,
+				detail: "plugin directory not resolved",
+			});
 			continue;
 		}
 
@@ -151,7 +178,12 @@ export async function applyUpdates(
 		try {
 			manifest = await readManifest(dir);
 		} catch (error) {
-			errors.push(`${host}: cannot read package.json (${String(error)})`);
+			failures.push({
+				name: updates.map((u) => u.name).join(", "),
+				kind: "install-failed",
+				host,
+				detail: `cannot read package.json (${String(error)})`,
+			});
 			continue;
 		}
 
@@ -178,22 +210,33 @@ export async function applyUpdates(
 				cwd: INSTALL[host].needsCwd ? dir : undefined,
 			});
 			if (result.code !== 0) {
-				errors.push(
-					`${update.name}: ${host} install failed (exit ${result.code})` +
-						(result.stderr ? ` - ${result.stderr.trim().split("\n").pop()}` : ""),
-				);
+				const kind = classifyFailure(result.stderr);
+				failures.push({
+					name: update.name,
+					kind,
+					host,
+					detail: failureDetail(result.stderr) || result.stderr?.trim().split("\n").pop() || "",
+				});
 			}
 		}
 	}
 
-	if (errors.length > 0) {
+	if (failures.length > 0) {
 		// Roll the whole batch back: a partial upgrade is harder to reason about
 		// than no upgrade.
 		await restoreEntries(backups);
-		return { ok: false, applied: [], backups, errors };
+		// A load failure keeps the host's own words out of it: the raw stderr is
+		// a full path and a function signature, and what the user needs is the
+		// verdict and the remedy, not the trace.
+		const errors = failures.map((f) =>
+			f.kind === "load-failed"
+				? `${f.name}: installed, but this host cannot load it on ${f.host}.`
+				: `${f.name}: install failed on ${f.host} — ${f.detail}`,
+		);
+		return { ok: false, applied: [], backups, errors, failures };
 	}
 
-	return { ok: true, applied: plan.updates, backups, errors: [] };
+	return { ok: true, applied: plan.updates, backups, errors: [], failures };
 }
 
 export async function restoreFromBackup(entries: BackupEntry[]): Promise<void> {

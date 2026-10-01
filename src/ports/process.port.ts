@@ -6,6 +6,17 @@ export interface RunResult {
 	stderr?: string;
 }
 
+/**
+ * Quote a value for the shell.
+ *
+ * Shared because two core modules build host commands and both got their own
+ * copy; a command built with the wrong quoting can be split into two arguments,
+ * which for an uninstaller means removing the wrong thing.
+ */
+export function quote(value: string): string {
+	return /[\s"'|&;<>()$`]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
+}
+
 /** Where to run a command. Needed by installers that take no target flag. */
 export interface RunOptions {
 	cwd?: string;

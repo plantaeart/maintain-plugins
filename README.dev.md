@@ -260,6 +260,32 @@ The flags are independent, and `sandbox-test.sh use` prints both. The e2e suite 
 
 `discoverOmp` therefore verifies every entry against `node_modules/<pkg>/package.json` — the same authority `omp plugin list` uses, and the same rule `discoverPi` applies to `settings.json`. A manifest dependency with no lock entry is treated the same way: reported at its installed version, or skipped when nothing is on disk.
 
+### Removing a plugin
+
+`/maint-uninstall-plugin` takes no argument: it lists what is currently installed, each row labelled `name@version`, and asks a second time before deleting. Cancelling the picker is the answer, so there is no separate "never mind" path.
+
+Removal is the only irreversible action in this extension, and the manifest backup does **not** cover it — that backup exists to undo a rewritten pin, and a deleted package is not something a copy of the manifest brings back. The confirmation says so.
+
+The uninstall itself is delegated to the host, because the two hosts track a plugin in three places and each knows how to clean all three:
+
+| Host | Command | Removes from |
+|---|---|---|
+| OMP | `omp plugin uninstall <name>` | `package.json`, `omp-plugins.lock.json`, `node_modules` |
+| Pi | `pi remove npm:<name>` | `settings.json`, `package.json`, `node_modules` |
+
+The argument forms are not interchangeable: omp's uninstaller rejects an `npm:` spec outright with "not installed", which reads like the plugin is missing. `buildUninstallCommand` in `src/core/uninstall.ts` is the single place that knows the difference, and `tests/unit/uninstall.test.ts` pins both forms.
+
+### Telling a failed install from an unloadable plugin
+
+`applyUpdates` classifies each failure rather than flattening them into one string, because the two problems have opposite fixes:
+
+| kind | what happened | what to do |
+|---|---|---|
+| `install-failed` | the package manager refused | fix the network or the version |
+| `load-failed` | it installed, and the host could not load it | usually a pi-only API on omp, or the reverse — remove it or pin the old version |
+
+A load failure looks like `pi.registerEntryRenderer is not a function`, which is a plugin calling a host API that exists in pi and not in omp. The package manager is perfectly happy about it, so reporting "install failed" would send the user looking for a problem that is not there. `/maint-update-all` names `/maint-uninstall-plugin` in that case, since removal is the actionable step.
+
 ### Each host installs with its own installer
 
 The installer choice is what keeps the next check honest, because each host's discovery reads a different artefact.

@@ -183,6 +183,57 @@ describe("applyUpdates", () => {
 		expect(seen).toEqual(["1/2 a", "2/2 b"]);
 	});
 
+	it("reports a plugin that installed but will not load as its own kind, not a failed install", async () => {
+		const dir = await makeOmpPluginDir({ "stale": "npm:stale@1.0.0" });
+
+		const result = await applyUpdates([record("stale", "1.0.0", "2.0.0")], {
+			pluginDirs: new Map([[HostPlatform.Omp, dir]]),
+			run: async () => ({
+				code: 1,
+				stderr:
+					"src/index.ts: Failed to load extension: pi.registerEntryRenderer is not a function.",
+			}),
+		});
+
+		expect(result.ok).toBe(false);
+		expect(result.failures).toHaveLength(1);
+		// The install itself worked; only the host's load of the new code failed,
+		// so saying "install failed" sends the user looking at npm for a problem
+		// that is not there. The message names the host, because "works on pi" is
+		// the explanation and the host is what it is being compared against.
+		expect(result.failures[0].kind).toBe("load-failed");
+		expect(result.failures[0].name).toBe("stale");
+		expect(result.failures[0].host).toBe(HostPlatform.Omp);
+		expect(result.errors[0]).toBe(
+			"stale: installed, but this host cannot load it on omp.",
+		);
+	});
+
+	it("reports a non-zero exit with no load failure as a plain install failure", async () => {
+		const dir = await makeOmpPluginDir({ "stale": "npm:stale@1.0.0" });
+
+		const result = await applyUpdates([record("stale", "1.0.0", "2.0.0")], {
+			pluginDirs: new Map([[HostPlatform.Omp, dir]]),
+			run: async () => ({ code: 1, stderr: "ENOTFOUND registry.npmjs.org" }),
+		});
+
+		expect(result.failures[0].kind).toBe("install-failed");
+		expect(result.errors[0]).toContain("install failed on omp");
+		expect(result.errors[0]).toContain("ENOTFOUND");
+	});
+
+	it("keeps the failure list empty when everything installs", async () => {
+		const dir = await makeOmpPluginDir({ "stale": "npm:stale@1.0.0" });
+
+		const result = await applyUpdates([record("stale", "1.0.0", "2.0.0")], {
+			pluginDirs: new Map([[HostPlatform.Omp, dir]]),
+			run: async () => ({ code: 0 }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.failures).toEqual([]);
+	});
+
 	it("restores the manifest and reports the failure when the package manager exits non-zero", async () => {
 		const dir = await makeOmpPluginDir({ "stale": "npm:stale@1.0.0" });
 		const before = await fs.readFile(path.join(dir, "package.json"), "utf8");

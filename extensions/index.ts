@@ -4,6 +4,7 @@ import type {
 	ExtensionContext,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { discoverPlugins } from "../src/core/plugin-registry";
 import { cachePathFor, detectHost, pluginDirFor } from "../src/core/paths";
 import { applyUpdates, buildUpdatePlan } from "../src/core/updater";
@@ -84,9 +85,30 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		return inFlight;
 	}
 
-	/** `  ⬆️ name: installed -> latest` — shared by the notice and both dialogs. */
+	/** `⬆️ name: installed -> latest` — shared by the notice and both dialogs. */
 	function staleRow(update: Pick<PluginRecord, "name" | "installed" | "latest">): string {
-		return `  ⬆️ ${update.name}: ${update.installed} -> ${update.latest}`;
+		return `⬆️ ${update.name}: ${update.installed} -> ${update.latest}`;
+	}
+
+	/**
+	 * Draw the notice as an open-right box: top rule, left edge, bottom rule.
+	 *
+	 * Deliberately no right border, which means the rows need no padding to line
+	 * up — only the two rules do, and both are drawn to the widest row. A closed
+	 * box would have to pad every row to a common display width, and an emoji
+	 * like ⬆️ occupies one cell while its string is two code points, so a naive
+	 * pad leaves every emoji row a column short.
+	 */
+	function boxBanner(title: string, rows: string[]): string[] {
+		const widest = Math.max(
+			visibleWidth(title) + 4,
+			...rows.map((row) => visibleWidth(row) + 2),
+		);
+		return [
+			`╭─ ${title} ${"─".repeat(Math.max(1, widest - visibleWidth(title) - 4))}`,
+			...rows.map((row) => `│ ${row}`),
+			`╰─${"─".repeat(Math.max(1, widest - 2))}`,
+		];
 	}
 
 	function formatReport(checked: PluginRecord[]): string {
@@ -111,14 +133,24 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * One line per stale plugin, capped so a machine with many stale plugins
-	 * gets a summary rather than a wall of text at session start.
+	 * The startup notice: a boxed title plus one row per stale plugin, capped so
+	 * a machine with many stale plugins gets a summary rather than a wall of
+	 * text. `formatStale` supplies the rows, so the notice and the update dialog
+	 * always read the same.
 	 */
 	function formatStale(checked: PluginRecord[], cap = 4): string {
 		const rows = checked.filter(isUpdateAvailable).map(staleRow);
-		return rows.length > cap
-			? `${rows.slice(0, cap).join("\n")}\n  … and ${rows.length - cap} more`
-			: rows.join("\n");
+		return boxBanner(staleTitle(rows.length, cap), [
+			...rows.slice(0, cap),
+			...(rows.length > cap ? [`… and ${rows.length - cap} more`] : []),
+			`Run /${ExtensionCommand.UPDATES_CHECK} for the full list.`,
+		]).join("\n");
+	}
+
+	function staleTitle(count: number, cap = 4): string {
+		const shown = Math.min(count, cap);
+		const rest = count > cap ? ` (showing ${shown})` : "";
+		return `⬆️ ${count} plugin update${count === 1 ? "" : "s"} available${rest}`;
 	}
 
 	// The notice has done its job as soon as the user acts on the session, so it
@@ -163,7 +195,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// Every version delta is shown before anything is written: this
 			// rewrites the host's plugin manifest, and a plugin pinned for a
 			// reason is the user's call, not this plugin's.
-			const summary = plan.updates.map(staleRow).join("\n");
+			const summary = plan.updates.map((u) => `  ${staleRow(u)}`).join("\n");
 			const confirmed = await ctx.ui.confirm(
 				"Update all plugins?",
 				`${plan.updates.length} plugin(s) will be updated:\n${summary}\n\nA backup of the manifest is kept and restored automatically if an install fails.`,
@@ -229,7 +261,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// reload picks up what was just written to disk. The dialog names each
 			// plugin, because the whole point of the question is "what am I about
 			// to reload", and a bare count answers nothing.
-			const reloading = result.applied.map(staleRow).join("\n");
+			const reloading = result.applied.map((u) => `  ${staleRow(u)}`).join("\n");
 			const reloadNow = await ctx.ui.confirm(
 				"Reload now?",
 				`${result.applied.length} plugin(s) updated. Reloading activates:\n${reloading}\n\n` +
@@ -248,16 +280,14 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		// session, and the notice only appears when something is actually stale.
 		void records()
 			.then((checked) => {
-				const stale = checked.filter(isUpdateAvailable);
-				if (stale.length === 0) return;
+				if (!checked.some(isUpdateAvailable)) return;
 				// Names the stale plugins rather than only counting them: this is the
 				// one message shown without the user asking for it, so a bare
 				// "1 update available" costs a follow-up command to become useful.
-				ctx.ui.setWidget(NOTICE_WIDGET_KEY, [
-					`⬆️ ${stale.length} plugin update(s) available:`,
-					formatStale(checked),
-					`Run /${ExtensionCommand.UPDATES_CHECK} for the full list.`,
-				]);
+				// One widget holding the whole box, not one per line: separate
+				// entries stack vertically and the top and bottom rules would drift
+				// apart from the rows between them.
+				ctx.ui.setWidget(NOTICE_WIDGET_KEY, formatStale(checked).split("\n"));
 				// An expiry, because not every way of using the session is visible
 				// to this extension. Host built-in commands (/plugin, /model, /help)
 				// fire no event an extension can observe - there is no hook for them -

@@ -164,6 +164,16 @@ JSON
   "settings": {}
 }
 JSON
+		# node_modules too, because discovery verifies it: a lock entry with
+		# nothing installed is a leftover, not a plugin. Without this the sandbox
+		# reports nothing and every check looks like a bug in the extension.
+		mkdir -p "${SANDBOX}/.omp/plugins/node_modules/${PACKAGE}"
+		cat > "${SANDBOX}/.omp/plugins/node_modules/${PACKAGE}/package.json" <<JSON
+{
+  "name": "${PACKAGE}",
+  "version": "${PIN}"
+}
+JSON
 	else
 		mkdir -p "${SANDBOX}/.pi/agent/npm/node_modules/${PACKAGE}"
 		[ -f "${REAL_HOME}/.pi/agent/auth.json" ] &&
@@ -210,8 +220,13 @@ JSON
 cmd_use() {
 	[ -d "${SANDBOX}" ] || die "no sandbox at ${SANDBOX}. Run: sandbox-test.sh init"
 
-	# pi has no --no-rules; the two hosts do not share a flag set.
-	local flags="--no-session --no-skills"
+	# --no-extensions is not optional. This package is installed in the real
+	# profile, and a host that discovers plugins loads that published copy too -
+	# so the launch would show two copies of everything: the working tree's
+	# behaviour and the installed one fighting over the same screen. Only the -e
+	# path survives, which is the point. HOME covers the plugin directory; this
+	# covers the extension itself.
+	local flags="--no-session --no-skills --no-extensions"
 	[ "${HOST}" = "omp" ] && flags="${flags} --no-rules"
 	flags="${flags} -e ${ROOT_DIR}/extensions/index.ts"
 
@@ -220,6 +235,9 @@ cmd_use() {
 	echo "#   /maint-update-all      confirm, then install into $(plugin_dir)"
 	echo ""
 	echo "HOME=\"${SANDBOX}\" ${HOST} ${flags}"
+	echo ""
+	echo "#   HOME=... keeps /maint-update-all away from your real plugin manifest."
+	echo "#   --no-extensions stops this package's installed copy from also running."
 	echo ""
 	echo "# Inspect what the sandbox resolved:"
 	if [ "${HOST}" = "omp" ]; then

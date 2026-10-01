@@ -177,8 +177,28 @@ Common causes, in the order they have actually happened here:
 | `No models available. Use /login` | the sandbox `models.yml` was edited or lost; re-run `sandbox-test.sh init` |
 | report shows the version just installed | `HOME` was not overridden on the spawned process, so discovery read the real profile |
 | a cached answer came back instead of the new one | use `uncachedNotify()` for a query asked twice |
+| sandbox reports no plugins at all | discovery verifies `node_modules`; a lock-only fixture is filtered as a leftover |
+| the same notice appears twice, or old behaviour shows up | `--no-extensions` missing, so this package's installed copy also loaded — see below |
 
-This extension writes **no log file**; `logPathFor()` exists in `src/core/paths.ts` but nothing calls it.
+**Spawn a host with both `HOME` and `--no-extensions`.** They cover different leaks, and a test missing either sees the wrong code:
+
+| flag | what it stops |
+|---|---|
+| `HOME: sandbox` | the test reading or writing your real plugin manifest |
+| `--no-extensions` | the published copy of *this* package loading next to the one under `-e` |
+
+```ts
+spawn(bin, [...quiet, "--no-extensions", "--mode", "rpc", "-e", EXT], {
+	// HOME isolates; os.tmpdir() is only tidiness.
+	cwd: os.tmpdir(),
+	env: { ...process.env, HOME: sandbox },
+	stdio: ["pipe", "pipe", "pipe"],
+})
+```
+
+`cwd` is irrelevant: a subdirectory of the repo behaves the same as `/tmp`.
+
+This extension writes **no log file**; when a check fails there is nothing on disk to read, which is why the failure message carries the host's stderr and every notification seen so far.
 
 ## Do not
 

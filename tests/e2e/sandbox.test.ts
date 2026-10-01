@@ -60,12 +60,28 @@ class HostSession {
 	#readers: { match: (frame: UiFrame) => boolean; resolve: (frame: UiFrame) => void }[] = [];
 	#buffer = "";
 	#stderr = "";
+	#cleared = new Map<string, number>();
 
 	constructor(bin: string, home: string, quiet: string[]) {
 		this.#child = spawn(
 			bin,
-			[...quiet, "--mode", "rpc", "-e", path.join(REPO_ROOT, "extensions/index.ts")],
-			{ cwd: REPO_ROOT, env: { ...process.env, HOME: home }, stdio: ["pipe", "pipe", "pipe"] },
+			[
+				...quiet,
+				// This package is also installed in the test runner's own profile.
+				// Without this the host discovers that copy too, and the test
+				// observes a mix of the code under test and the published one.
+				"--no-extensions",
+				"--mode",
+				"rpc",
+				"-e",
+				path.join(REPO_ROOT, "extensions/index.ts"),
+			],
+			{
+				// HOME is what isolates; os.tmpdir() is only tidiness.
+				cwd: os.tmpdir(),
+				env: { ...process.env, HOME: home },
+				stdio: ["pipe", "pipe", "pipe"],
+			},
 		);
 		this.#child.stdout.on("data", (chunk: Buffer) => this.#consume(chunk.toString()));
 		this.#child.stderr.on("data", (chunk: Buffer) => {
@@ -87,6 +103,15 @@ class HostSession {
 			} catch {
 				continue;
 			}
+			if (
+				frame.type === "extension_ui_request" &&
+				frame.method === "setWidget" &&
+				frame.widgetKey !== undefined &&
+				(frame.widgetLines === undefined || frame.widgetLines.length === 0)
+			) {
+				const key = frame.widgetKey;
+				this.#cleared.set(key, (this.#cleared.get(key) ?? 0) + 1);
+			}
 			const index = this.#readers.findIndex((reader) => reader.match(frame));
 			if (index >= 0) {
 				const [reader] = this.#readers.splice(index, 1);
@@ -95,6 +120,13 @@ class HostSession {
 				this.#pending.push(frame);
 			}
 		}
+	}
+
+	/**
+	 * How many times a named widget has been cleared.
+	 */
+	clearedWidgets(key: string): number {
+		return this.#cleared.get(key) ?? 0;
 	}
 
 	/**
@@ -122,18 +154,6 @@ class HostSession {
 
 	run(command: string) {
 		this.#child.stdin.write(`${JSON.stringify({ type: "prompt", message: command })}\n`);
-	}
-
-	/**
-	 * A command is proven registered by the host answering it.
-	 *
-	 * omp broadcasts an `available_commands_update` frame and pi does not, so
-	 * waiting on that frame would hang on one host forever. Both register the
-	 * commands; only the announcement differs.
-	 */
-	async answered(command: string, match: RegExp, what: string): Promise<string> {
-		this.run(command);
-		return this.notify(match, what);
 	}
 
 	async notify(match: RegExp, what: string): Promise<string> {
@@ -191,19 +211,20 @@ class HostSession {
 	}
 
 	/**
-	 * Resolve once the progress widget has been cleared.
+	 * Resolve once the named widget has been cleared.
 	 *
-	 * A widget left on screen after the run would sit above the editor for the
-	 * rest of the session, claiming work that is already done.
+	 * A widget left on screen after its moment passed would sit above the editor
+	 * for the rest of the session claiming work that is already done.
 	 */
-	async widgetCleared(timeoutMs = 30_000): Promise<boolean> {
+	async widgetCleared(key: string, timeoutMs = 30_000): Promise<boolean> {
 		try {
 			await this.#next(
 				(f) =>
 					f.type === "extension_ui_request" &&
 					f.method === "setWidget" &&
+					f.widgetKey === key &&
 					(f.widgetLines === undefined || f.widgetLines.length === 0),
-				"the progress widget to be cleared",
+				`the ${key} widget to be cleared`,
 				timeoutMs,
 			);
 			return true;
@@ -305,22 +326,27 @@ describe("sandbox e2e", () => {
 
 					session = new HostSession(testCase.bin, sandbox, [...testCase.quiet]);
 
-					// The session-start notice doubles as proof the extension loaded
-					// and resolved its plugin directory. The glyph is asserted
-					// because it is the only way a stale plugin is distinguishable:
-					// ctx.ui.notify() paints every level the same grey. The listing is
-					// asserted because a bare count costs the user a second command
-					// to become useful.
-					const notice = await session.notify(
-						/plugin update\(s\) available/,
-						"the session-start notice",
-					);
+					// The startup notice is a widget, not a notify: notify("info")
+					// lands on a replaceable status line that another plugin can clobber,
+					// and this check is async so it cannot win that race by ordering.
+					const notice = await session.widget(/plugin update\(s\) available/, "the startup notice");
 					expect(notice).toContain("⬆️ 1 plugin update(s) available:");
 					expect(notice).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
 					expect(notice).toContain("Run /maint-updates-check for the full list.");
 
-					const report = await session.answered(
-						"/maint-updates-check",
+					// Using the session must take the banner down. A slash command
+					// never ends a turn, so waiting on turn_end alone left it up for
+					// the rest of the session - and it stacked on top of the report
+					// the command itself produced.
+					session.run("/maint-updates-check");
+					expect(await session.widgetCleared("maintain-plugins-notice")).toBe(true);
+					// Exactly one clear: dismissNotice cancels the expiry timer, so a
+					// later expiry must not re-clear a widget that may have been set
+					// again in the meantime.
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					expect(session.clearedWidgets("maintain-plugins-notice")).toBe(1);
+
+					const report = await session.uncachedNotify(
 						/installed, 1 update available/,
 						"the check report",
 					);
@@ -346,17 +372,21 @@ describe("sandbox e2e", () => {
 					);
 					// An install takes seconds with nothing else on screen; the row
 					// must be cleared once it is over, not left behind forever.
-					expect(await session.widgetCleared()).toBe(true);
+					expect(await session.widgetCleared("maintain-plugins-progress")).toBe(true);
 
 					// The session still holds the old plugin code until it reloads,
 					// and the dialog has to say which plugins it would activate -
 					// the question is "what am I about to reload", not "how many".
 					const reloadPrompt = await session.confirm(false, "the reload offer");
 					expect(reloadPrompt).toBe("Reload now?");
-					expect(session.lastConfirmMessage).toContain(`⬆️ ${PACKAGE} ${PIN} ->`);
+					expect(session.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
 					expect(session.lastConfirmMessage).toContain(
 						testCase.host === "omp" ? "/reload-plugins" : "/reload",
 					);
+
+					// The notice listed exactly what was just applied, so it clears
+					// itself rather than claiming updates that no longer exist.
+					expect(await session.widgetCleared("maintain-plugins-notice")).toBe(true);
 
 					const updated = await fs.readFile(manifest, "utf8");
 					expect(updated).not.toContain(`@${PIN}`);

@@ -1,0 +1,36 @@
+{
+  "name": "maintain-plugins",
+  "version": "0.1.0",
+  "description": "Pi extension that checks installed plugin versions against npm and updates them safely on request",
+  "type": "module",
+  "main": "extensions/index.ts",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "image": "./assets/imgs/maint-update-header-image.png"
+  },
+  "extensions": [
+    "./extensions"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "lint": "oxlint",
+    "typecheck": "tsc --noEmit",
+    "validate:skills": "bash .agents/skills/ci-check/scripts/validate-skills.sh",
+    "ci": "bun run lint && bun run typecheck && bun test && bun run validate:skills"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "bun-types": "^1.4.2",
+    "oxlint": "^1.85.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

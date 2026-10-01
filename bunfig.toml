@@ -1,0 +1,4 @@
+[test]
+# Global safety net: removes sandbox directories left behind by an earlier
+# crashed run before the suite starts, and anything a test registers on exit.
+preload = ["./tests/helpers/global-setup.ts"]

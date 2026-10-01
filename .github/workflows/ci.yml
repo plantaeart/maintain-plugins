@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # OMPCODE is set per leg so the suite is exercised in both ambient
+        # environments, the way a real pi and a real omp session differ. It is
+        # NOT a host signal this code trusts: src/core/paths.ts documents that
+        # pi sets OMPCODE=1 too, and detectHost() reads argv instead.
+        #
+        # Both hosts are genuinely covered because tests/e2e/sandbox.test.ts
+        # spawns the real `pi` and `omp` binaries - each leg runs the same two.
+        # Host-specific behaviour is pinned by argv fixtures in
+        # tests/unit/host-detection.test.ts, which do not read the environment.
+        include:
+          - host: pi
+            ompcode: '0'
+          - host: omp
+            ompcode: '1'
+    name: test (${{ matrix.host }})
+    env:
+      OMPCODE: ${{ matrix.ompcode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.20.0'
+
+      # The e2e smoke test spawns a real host CLI, and detectHost() reads the
+      # environment the real host sets. Installing both makes the run exercise
+      # the genuine code path instead of a faked one.
+      - name: Install Pi and OMP CLIs
+        # Pinned, not @latest: a floating tag means a green badge says nothing about
+        # tomorrow. `.agents/skills/host-version/scripts/check-host-versions.sh`
+        # reports when a newer release exists.
+        run: npm install -g @earendil-works/pi-coding-agent@0.99.1 @oh-my-pi/pi-coding-agent@18.4.5
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Type-check
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+  lint-skills:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          uv-version: '0.12.9'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.20.0'
+
+      - name: Install skills-ref tool
+        run: uv tool install git+https://github.com/agentskills/agentskills.git@69ef37e9424c0a7ea9dd2293b559e43ec8176379#subdirectory=skills-ref
+
+      # Same script `bun run validate:skills` runs locally, so CI and a
+      # contributor can never validate against different rules.
+      - name: Validate skills
+        run: bash .agents/skills/ci-check/scripts/validate-skills.sh

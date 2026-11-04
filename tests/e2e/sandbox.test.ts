@@ -250,8 +250,16 @@ class HostSession {
 		}
 	}
 
-	close() {
+	/**
+	 * Stop the host and wait until it has exited. A host still shutting down
+	 * writes back into its HOME, so deleting that HOME has to wait for this.
+	 */
+	async close(): Promise<void> {
+		if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#child.once("exit", () => resolve());
 		this.#child.kill("SIGTERM");
+		await promise;
 	}
 }
 
@@ -448,7 +456,7 @@ describe("sandbox e2e", () => {
 			});
 
 			afterAll(async () => {
-				session?.close();
+				await session?.close();
 				registry?.stop(true);
 				if (sandbox !== "") await fs.rm(sandbox, { recursive: true, force: true });
 			});
@@ -609,7 +617,11 @@ describe("sandbox e2e", () => {
 						expect(await fs.readFile(manifestPath, "utf8")).not.toContain(PACKAGE);
 						expect(await sha256(testCase.realManifest())).toBe(realBefore);
 					} finally {
-						fresh.close();
+						// Deleted here rather than by the global teardown: each omp HOME
+						// holds the host's natives, and the teardown has one 5 s budget
+						// for all of them.
+						await fresh.close();
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -637,8 +649,9 @@ describe("sandbox e2e", () => {
 						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 						expect(report).toContain("/maint-update-all");
 					} finally {
-						fresh.close();
+						await fresh.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -663,8 +676,9 @@ describe("sandbox e2e", () => {
 						const notice = await fresh.widget(/plugin update.* available/, "the startup notice");
 						expect(notice).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 					} finally {
-						fresh.close();
+						await fresh.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -690,7 +704,8 @@ describe("sandbox e2e", () => {
 						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 						expect(report).toContain("/maint-update-all");
 					} finally {
-						offline.close();
+						await offline.close();
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -740,7 +755,7 @@ describe("sandbox e2e", () => {
 						} else {
 							expect(applied).toContain("Run /restart to load it");
 							expect(applied).toContain("remaining 1 plugin(s)");
-							fresh.close();
+							await fresh.close();
 							next = restarted = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
 						}
 
@@ -755,9 +770,10 @@ describe("sandbox e2e", () => {
 						expect(done).toContain(testCase.host === "omp" ? "Run /restart to load it" : "/reload");
 						expect(await installed(PACKAGE)).toBe(LATEST);
 					} finally {
-						fresh.close();
-						restarted?.close();
+						await fresh.close();
+						await restarted?.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				240_000,
@@ -810,6 +826,17 @@ describe("omp terminal restart", () => {
 				"-e", quote(path.join(REPO_ROOT, "extensions/index.ts")),
 			].join(" "),
 		);
+		// `env` execs omp, so the pane's process is omp itself, and an in-place
+		// restart keeps that pid.
+		const pid = Number(tmux("display-message", "-p", "-t", session, "#{pane_pid}").trim());
+		const alive = () => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
 		const screen = () => tmux("capture-pane", "-t", session, "-p");
 		return {
 			screen,
@@ -835,6 +862,8 @@ describe("omp terminal restart", () => {
 			describeScreen: () => `screen:\n${screen().slice(-800)}`,
 			close: async () => {
 				tmux("kill-session", "-t", session);
+				// A host still shutting down writes back into its HOME.
+				await until(() => !alive(), "omp to exit", () => `pid ${pid} still running`);
 				registry.stop(true);
 				await fs.rm(home, { recursive: true, force: true });
 				await fs.rm(project, { recursive: true, force: true });

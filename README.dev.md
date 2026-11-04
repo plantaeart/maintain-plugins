@@ -197,6 +197,8 @@ bun test -t "omp"            # one host
 
 It covers, per host: the session-start notice fires; `/maint-updates-check` reports the delta and writes nothing; declining the confirm writes nothing; accepting it installs into the sandbox **and leaves the real manifest byte-identical**.
 
+One test is not rpc: `omp terminal restart` drives the real terminal UI through `tmux`. omp's in-place restart (`ctx.shutdown()` followed by `process.execve` on the same command line plus `--resume <session file>`) only exists there — under rpc, `shutdown()` does not end the host — so no rpc frame can show it. The test asserts that omp comes back on the same conversation and that the extension in the new process offers the remaining plugin. It skips when `tmux` or `omp` is missing. The command-line rebuild itself (`src/core/restart.ts`) is unit-tested; it mirrors what omp's private `/restart` builds, from the flag list in `omp --help`, so re-check `VALUE_FLAGS` when omp adds a flag that takes a value.
+
 A command is asserted by the host *answering* it, not by an `available_commands_update` frame: omp broadcasts that frame and pi does not, so waiting on it would hang on one host forever.
 
 The suite skips with a printed reason when the host CLI is off `PATH`, so a contributor without `omp` and `pi` is not blocked. Each test builds its own sandbox under `os.tmpdir()`, never the skill's default, so it cannot collide with a sandbox you are using, and removes it afterwards.

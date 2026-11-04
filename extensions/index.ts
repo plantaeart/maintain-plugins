@@ -6,10 +6,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { discoverPlugins } from "../src/core/plugin-registry";
-import { cachePathFor, detectHost, pluginDirFor } from "../src/core/paths";
+import { cachePathFor, continuePathFor, detectHost, pluginDirFor } from "../src/core/paths";
+import { RUNNING_VERSION, reloadPending } from "../src/core/self";
 import { uninstallPlugin } from "../src/core/uninstall";
-import { applyUpdates, buildUpdatePlan } from "../src/core/updater";
-import { DEFAULT_TTL_MS, checkVersions } from "../src/core/version-check";
+import { SELF_NAME, applyUpdates, buildUpdatePlan } from "../src/core/updater";
+import { checkVersions, type CheckResult } from "../src/core/version-check";
+import { clearContinue, consumeContinue, markContinue } from "../src/ports/continue.port";
 import { lookupNpmVersion } from "../src/ports/registry.port";
 import { HostPlatform } from "../src/core/types/host-platform.type";
 import { isUpdateAvailable, type PluginRecord } from "../src/core/types/plugin-record.type";
@@ -60,30 +62,38 @@ const NOTICE_TTL_MS = 20_000;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
 
+/**
+ * How long a continue marker stays meaningful. It is written just before a
+ * reload and read by the session that starts straight after, so anything older
+ * is not that reload.
+ */
+const CONTINUE_MAX_AGE_MS = 10 * 60_000;
+
 export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 	const host = detectHost();
 	// Resolved once: the host directory does not move while the session runs.
 	const pluginDir = pluginDirFor(host);
 	const cacheFile = cachePathFor(host);
+	const continueFile = continuePathFor(host);
 
-	// One check per session, shared by the startup notice and both commands, so
-	// a start followed by /maint-updates-check does not re-query the registry.
-	let inFlight: Promise<PluginRecord[]> | undefined;
-
-	function records(): Promise<PluginRecord[]> {
-		inFlight ??= (async () => {
+	// Every check asks the registry: a session start, /maint-updates-check and
+	// /maint-update-all all want what is published now, not what a cache or an
+	// earlier call in this session remembers. The cache file survives only as
+	// the offline fallback inside checkVersions.
+	async function check(): Promise<CheckResult> {
+		try {
 			const discovered = await discoverPlugins(host);
-			return checkVersions(discovered, {
+			const result = await checkVersions(discovered, {
 				lookup: lookupNpmVersion,
 				cacheFile,
-				ttlMs: DEFAULT_TTL_MS,
+				force: true,
 			});
-		})().catch(() => {
-			// A failed check must not poison later calls in this session.
-			inFlight = undefined;
-			return [];
-		});
-		return inFlight;
+			// This plugin first everywhere it is listed: it is what updates first.
+			result.records.sort((a, b) => Number(b.name === SELF_NAME) - Number(a.name === SELF_NAME));
+			return result;
+		} catch {
+			return { records: [], live: false };
+		}
 	}
 
 	/** `⬆️ name: installed -> latest` — shared by the notice and both dialogs. */
@@ -112,7 +122,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		];
 	}
 
-	function formatReport(checked: PluginRecord[]): string {
+	function formatReport({ records: checked, live, checkedAt }: CheckResult): string {
 		if (checked.length === 0) {
 			return `No ${host} plugins found under ${pluginDir}`;
 		}
@@ -130,7 +140,21 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		const header = `${host} plugins (${checked.length} installed, ${stale.size} update${
 			stale.size === 1 ? "" : "s"
 		} available)`;
-		return [header, ...lines].join("\n");
+		// A cached answer looks identical to a live one unless it says so, and the
+		// user is about to act on it.
+		let age = "";
+		if (checkedAt !== undefined) {
+			const minutes = Math.max(0, Math.round((Date.now() - checkedAt) / 60_000));
+			age = ` from ${minutes < 60 ? `${minutes} min` : `${Math.round(minutes / 60)} h`} ago`;
+		}
+		const notes = [
+			...(live ? [] : [`⚠️ Could not reach the registry for every plugin: showing cached versions${age}.`]),
+			...(stale.size === 0 ? [] : [`Run /${ExtensionCommand.UPDATE_ALL} to update.`]),
+			...(checked.some((r) => r.name === SELF_NAME && stale.has(r))
+				? [`${SELF_NAME} updates first; the rest follow after a ${host === HostPlatform.Omp ? "restart" : "reload"}.`]
+				: []),
+		];
+		return [header, ...lines, ...(notes.length > 0 ? ["", ...notes] : [])].join("\n");
 	}
 
 	/**
@@ -169,6 +193,154 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		ctx.ui.setWidget(NOTICE_WIDGET_KEY, undefined);
 	};
 
+	/** How to say "make the new plugin code take effect" on this host. */
+	const restartHint = host === HostPlatform.Omp ? "Restart omp" : "Run /reload";
+
+	/**
+	 * The whole update flow, shared by the command and by the session that
+	 * continues it after this plugin updated itself.
+	 *
+	 * `reload` is only honoured on pi, whose reload re-runs every extension. omp's
+	 * `ctx.reload()` merely re-opens the session file and leaves plugin code in
+	 * memory, and no extension can run omp's `/reload-plugins` (a user message
+	 * goes to the model), so omp updates take effect on the next start.
+	 */
+	async function updateAll(ctx: ExtensionContext, reload?: () => Promise<void>): Promise<void> {
+		const { records: checked } = await check();
+		const plan = buildUpdatePlan(checked);
+
+		if (plan.updates.length === 0) {
+			ctx.ui.notify(`All ${host} plugins are up to date.`, "info");
+			return;
+		}
+
+		// The disk can be ahead of the code in memory: this plugin updated itself
+		// and nobody reloaded. The rest then updates with the old logic, which is
+		// exactly what updating itself first was meant to avoid, so say so.
+		const ahead = plan.updates.some((u) => u.name === SELF_NAME) ? undefined : reloadPending(checked);
+		if (ahead !== undefined) {
+			ctx.ui.notify(
+				`⚠️ ${SELF_NAME} ${ahead} is installed but ${RUNNING_VERSION} is still running. ` +
+					`${restartHint} so the new update logic is the one in use.`,
+				"warning",
+			);
+		}
+
+		// Every version delta is shown before anything is written: this
+		// rewrites the host's plugin manifest, and a plugin pinned for a
+		// reason is the user's call, not this plugin's.
+		const summary = plan.updates.map((u) => `  ${staleRow(u)}`).join("\n");
+		const waiting =
+			plan.deferred.length > 0
+				? `\n\nUpdating ${SELF_NAME} first, so the new version upgrades the rest. ` +
+					`These update after the ${host === HostPlatform.Omp ? "restart" : "reload"}:\n${plan.deferred.map((u) => `  ${staleRow(u)}`).join("\n")}`
+				: "";
+		const confirmed = await ctx.ui.confirm(
+			"Update all plugins?",
+			`${plan.updates.length} plugin(s) will be updated:\n${summary}${waiting}\n\nA backup of the manifest is kept and restored automatically if an install fails.`,
+		);
+		if (!confirmed) {
+			ctx.ui.notify("Update cancelled.", "info");
+			return;
+		}
+
+		// A widget above the editor, not setWorkingMessage: the working
+		// message only draws while the agent is streaming, and a command
+		// handler runs between turns. An install produces no output of its
+		// own, so without this a long run is an unexplained pause.
+		//
+		// The row is re-set on a timer so the spinner animates, because
+		// setWidget calls requestRender() on every call. `text` holds the line
+		// unprefixed and the glyph is added at paint time — feeding paint() its
+		// own output back would prepend a second glyph every tick.
+		let frame = 0;
+		let text = `⬆️ Updating 0/${plan.updates.length}…`;
+		const paint = () => {
+			const glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
+			frame++;
+			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, [`${glyph} ${text}`]);
+		};
+		paint();
+		const spinner = setInterval(paint, SPINNER_INTERVAL_MS);
+
+		const result = await applyUpdates(checked, {
+			pluginDirs: new Map([[host, pluginDir]]),
+			onProgress: (update, index, total) => {
+				text = `⬆️ Updating ${index}/${total} — ${update.name}`;
+				paint();
+			},
+		});
+		clearInterval(spinner);
+		ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+
+		if (!result.ok) {
+			// The manifest has already been rolled back by applyUpdates.
+			// A load failure is the actionable case: the install worked, the
+			// host cannot run the new code, and the way out is to remove it.
+			const unloadable = result.failures.filter((f) => f.kind === "load-failed");
+			const hint =
+				unloadable.length > 0
+					? `\n\nRun /${ExtensionCommand.UNINSTALL_PLUGIN} to remove the plugins that can't work with ${host} anymore.`
+					: "";
+			ctx.ui.notify(
+				`❌ Update failed, plugin manifest restored:\n${result.errors.join("\n")}${hint}`,
+				"error",
+			);
+			return;
+		}
+
+		// The startup notice listed exactly what was just applied, so it is now
+		// stale itself; leaving it would claim updates that no longer exist.
+		// dismissNotice, not a bare clear, so the expiry is cancelled with it.
+		dismissNotice(ctx);
+		const hotReload = host === HostPlatform.Pi ? reload : undefined;
+		// Written when the rest has to wait for new code: the session that starts
+		// next carries on with it. On pi that is after the reload below, so it is
+		// written there, once the user has said yes.
+		if (plan.deferred.length > 0 && !hotReload) await markContinue(continueFile, ctx.cwd);
+		ctx.ui.notify(
+			`✅ Updated ${result.applied.length} plugin(s):\n` +
+				result.applied.map((u) => `  ⬆️ ${u.name} -> ${u.latest}`).join("\n") +
+				(hotReload
+					? ""
+					: `\n\n${restartHint} to load ${result.applied.length === 1 ? "it" : "them"}.` +
+						(plan.deferred.length > 0
+							? ` The remaining ${plan.deferred.length} plugin(s) are offered for update on that start.`
+							: "")),
+			"info",
+		);
+		if (!hotReload) return;
+
+		// The running session still holds the old plugin code: the extension
+		// in memory, and every other extension that session started. Only a
+		// reload picks up what was just written to disk. The dialog names each
+		// plugin, because the whole point of the question is "what am I about
+		// to reload", and a bare count answers nothing.
+		const reloading = result.applied.map((u) => `  ${staleRow(u)}`).join("\n");
+		const next =
+			plan.deferred.length > 0
+				? `\n\nAfter the reload, the remaining ${plan.deferred.length} plugin(s) are offered for update.`
+				: "";
+		const reloadNow = await ctx.ui.confirm(
+			"Reload now?",
+			`${result.applied.length} plugin(s) updated. Reloading activates:\n${reloading}${next}\n\n` +
+				`Or run /reload yourself later.`,
+		);
+		if (reloadNow) {
+			if (plan.deferred.length > 0) await markContinue(continueFile, ctx.cwd);
+			try {
+				await hotReload();
+			} catch (error) {
+				// The reload that would have consumed the marker never happened.
+				await clearContinue(continueFile);
+				ctx.ui.notify(
+					`⚠️ Reload failed (${error instanceof Error ? error.message : String(error)}). Run /reload yourself.`,
+					"warning",
+				);
+			}
+		}
+	}
+
 	// --- Commands ---
 
 	pi.registerCommand(ExtensionCommand.UPDATES_CHECK, {
@@ -177,108 +349,13 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			// The banner is replaced by this report, so it goes first rather than
 			// sitting above the editor while the answer is already on screen.
 			dismissNotice(ctx);
-			const checked = await records();
-			ctx.ui.notify(formatReport(checked), "info");
+			ctx.ui.notify(formatReport(await check()), "info");
 		},
 	});
 
 	pi.registerCommand(ExtensionCommand.UPDATE_ALL, {
 		description: EXTENSION_COMMAND_CATALOG[ExtensionCommand.UPDATE_ALL].description,
-		handler: async (_args: string, ctx: ExtensionCommandContext) => {
-			const checked = await records();
-			const plan = buildUpdatePlan(checked);
-
-			if (plan.updates.length === 0) {
-				ctx.ui.notify(`All ${host} plugins are up to date.`, "info");
-				return;
-			}
-
-			// Every version delta is shown before anything is written: this
-			// rewrites the host's plugin manifest, and a plugin pinned for a
-			// reason is the user's call, not this plugin's.
-			const summary = plan.updates.map((u) => `  ${staleRow(u)}`).join("\n");
-			const confirmed = await ctx.ui.confirm(
-				"Update all plugins?",
-				`${plan.updates.length} plugin(s) will be updated:\n${summary}\n\nA backup of the manifest is kept and restored automatically if an install fails.`,
-			);
-			if (!confirmed) {
-				ctx.ui.notify("Update cancelled.", "info");
-				return;
-			}
-
-			// A widget above the editor, not setWorkingMessage: the working
-			// message only draws while the agent is streaming, and a command
-			// handler runs between turns. An install produces no output of its
-			// own, so without this a long run is an unexplained pause.
-			//
-			// The row is re-set on a timer so the spinner animates, because
-			// setWidget calls requestRender() on every call. `text` holds the line
-			// unprefixed and the glyph is added at paint time — feeding paint() its
-			// own output back would prepend a second glyph every tick.
-			let frame = 0;
-			let text = `⬆️ Updating 0/${plan.updates.length}…`;
-			const paint = () => {
-				const glyph = SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
-				frame++;
-				ctx.ui.setWidget(PROGRESS_WIDGET_KEY, [`${glyph} ${text}`]);
-			};
-			paint();
-			const spinner = setInterval(paint, SPINNER_INTERVAL_MS);
-
-			const result = await applyUpdates(checked, {
-				pluginDirs: new Map([[host, pluginDir]]),
-				onProgress: (update, index, total) => {
-					text = `⬆️ Updating ${index}/${total} — ${update.name}`;
-					paint();
-				},
-			});
-			clearInterval(spinner);
-			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
-
-			if (!result.ok) {
-				// The manifest has already been rolled back by applyUpdates.
-				// A load failure is the actionable case: the install worked, the
-				// host cannot run the new code, and the way out is to remove it.
-				const unloadable = result.failures.filter((f) => f.kind === "load-failed");
-				const hint =
-					unloadable.length > 0
-						? `\n\nRun /${ExtensionCommand.UNINSTALL_PLUGIN} to remove the plugins that can't work with ${host} anymore.`
-						: "";
-				ctx.ui.notify(
-					`❌ Update failed, plugin manifest restored:\n${result.errors.join("\n")}${hint}`,
-					"error",
-				);
-				return;
-			}
-
-			// The cached versions are now stale in the other direction; drop them
-			// so the next check reflects what is actually installed.
-			inFlight = undefined;
-			// The startup notice listed exactly what was just applied, so it is now
-			// stale itself; leaving it would claim updates that no longer exist.
-			// dismissNotice, not a bare clear, so the expiry is cancelled with it.
-			dismissNotice(ctx);
-			ctx.ui.notify(
-				`✅ Updated ${result.applied.length} plugin(s):\n` +
-					result.applied.map((u) => `  ⬆️ ${u.name} -> ${u.latest}`).join("\n"),
-				"info",
-			);
-
-			// The running session still holds the old plugin code: the extension
-			// in memory, and every other extension that session started. Only a
-			// reload picks up what was just written to disk. The dialog names each
-			// plugin, because the whole point of the question is "what am I about
-			// to reload", and a bare count answers nothing.
-			const reloading = result.applied.map((u) => `  ${staleRow(u)}`).join("\n");
-			const reloadNow = await ctx.ui.confirm(
-				"Reload now?",
-				`${result.applied.length} plugin(s) updated. Reloading activates:\n${reloading}\n\n` +
-					`Or run ${host === HostPlatform.Omp ? "/reload-plugins" : "/reload"} yourself later.`,
-			);
-			if (reloadNow) {
-				await ctx.reload();
-			}
-		},
+		handler: (_args: string, ctx: ExtensionCommandContext) => updateAll(ctx, () => ctx.reload()),
 	});
 
 	pi.registerCommand(ExtensionCommand.UNINSTALL_PLUGIN, {
@@ -313,8 +390,6 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 
 			const result = await uninstallPlugin(host, picked);
 			ctx.ui.notify(result.message, result.ok ? "info" : "error");
-			// The plugin is gone, so anything cached about it is now wrong.
-			if (result.ok) inFlight = undefined;
 		},
 	});
 
@@ -323,8 +398,16 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 	pi.on(ExtensionEventType.SessionStart, (_event: SessionStartEvent, ctx: ExtensionContext) => {
 		// Detached and silent: a registry round trip must never delay or block a
 		// session, and the notice only appears when something is actually stale.
-		void records()
-			.then((checked) => {
+		void consumeContinue(continueFile, { cwd: ctx.cwd, maxAgeMs: CONTINUE_MAX_AGE_MS })
+			.then(async (resume) => {
+				// This plugin just updated itself and reloaded: carry on with the
+				// rest, now under the new code. The same confirmation as the
+				// command, so nothing is written without a yes.
+				if (resume) {
+					await updateAll(ctx);
+					return;
+				}
+				const { records: checked } = await check();
 				if (!checked.some(isUpdateAvailable)) return;
 				// Names the stale plugins rather than only counting them: this is the
 				// one message shown without the user asking for it, so a bare

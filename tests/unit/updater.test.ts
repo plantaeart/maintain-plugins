@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { applyUpdates, buildUpdatePlan, restoreFromBackup } from "../../src/core/updater";
+import { SELF_NAME, applyUpdates, buildUpdatePlan, restoreFromBackup } from "../../src/core/updater";
 import { HostPlatform } from "../../src/core/types/host-platform.type";
 import type { PluginRecord } from "../../src/core/types/plugin-record.type";
 
@@ -80,6 +80,43 @@ describe("buildUpdatePlan", () => {
 
 		expect(plan.byHost.get(HostPlatform.Omp)?.map((u) => u.name)).toEqual(["a"]);
 		expect(plan.byHost.get(HostPlatform.Pi)?.map((u) => u.name)).toEqual(["b"]);
+	});
+
+	it("plans this plugin alone when it is stale, deferring the rest until it has reloaded", () => {
+		const plan = buildUpdatePlan([
+			record("other", "1.0.0", "2.0.0"),
+			record(SELF_NAME, "0.4.0", "0.5.0"),
+		]);
+
+		// A newer maintain-plugins may carry the fix for upgrading the others, so
+		// the old code in memory must not be the one that upgrades them.
+		expect(plan.updates.map((u) => u.name)).toEqual([SELF_NAME]);
+		expect(plan.deferred.map((u) => u.name)).toEqual(["other"]);
+		expect(plan.byHost.get(HostPlatform.Omp)?.map((u) => u.name)).toEqual([SELF_NAME]);
+	});
+
+	it("plans everything at once when this plugin is current", () => {
+		const plan = buildUpdatePlan([
+			record("other", "1.0.0", "2.0.0"),
+			record(SELF_NAME, "0.5.0", "0.5.0"),
+		]);
+
+		expect(plan.updates.map((u) => u.name)).toEqual(["other"]);
+		expect(plan.deferred).toEqual([]);
+	});
+
+	it("does not hold the others back for a disabled copy of this plugin", () => {
+		const plan = buildUpdatePlan([
+			record("other", "1.0.0", "2.0.0"),
+			{ ...record(SELF_NAME, "0.4.0", "0.5.0"), enabled: false },
+		]);
+
+		expect(plan.updates.map((u) => u.name)).toEqual(["other"]);
+	});
+
+	it("matches the package name this repo publishes under", async () => {
+		const pkg = JSON.parse(await fs.readFile(path.join(import.meta.dir, "../../package.json"), "utf8"));
+		expect(SELF_NAME).toBe(pkg.name);
 	});
 });
 
@@ -278,6 +315,31 @@ describe("applyUpdates", () => {
 
 		expect(ran).toBe(false);
 		expect(result.ok).toBe(true);
+	});
+
+	it("installs only this plugin when it is stale, leaving the others' pins untouched", async () => {
+		const dir = await makeOmpPluginDir({
+			[SELF_NAME]: `npm:${SELF_NAME}@0.4.0`,
+			other: "npm:other@1.0.0",
+		});
+		const seen: string[] = [];
+
+		const result = await applyUpdates(
+			[record(SELF_NAME, "0.4.0", "0.5.0"), record("other", "1.0.0", "2.0.0")],
+			{
+				pluginDirs: new Map([[HostPlatform.Omp, dir]]),
+				run: async (cmd) => {
+					seen.push(cmd);
+					return { code: 0 };
+				},
+			},
+		);
+
+		expect(result.applied.map((u) => u.name)).toEqual([SELF_NAME]);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toContain(`${SELF_NAME}@0.5.0`);
+		const manifest = JSON.parse(await fs.readFile(path.join(dir, "package.json"), "utf8"));
+		expect(manifest.dependencies.other).toBe("npm:other@1.0.0");
 	});
 });
 

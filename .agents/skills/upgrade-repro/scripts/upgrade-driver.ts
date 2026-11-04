@@ -3,7 +3,7 @@
 import { discoverPlugins } from "../../../../src/core/plugin-registry";
 import { cachePathFor, pluginDirFor } from "../../../../src/core/paths";
 import { applyUpdates } from "../../../../src/core/updater";
-import { DEFAULT_TTL_MS, checkVersions } from "../../../../src/core/version-check";
+import { checkVersions } from "../../../../src/core/version-check";
 import { lookupNpmVersion } from "../../../../src/ports/registry.port";
 import { HostPlatform } from "../../../../src/core/types/host-platform.type";
 import { isUpdateAvailable } from "../../../../src/core/types/plugin-record.type";
@@ -12,7 +12,7 @@ const host = (process.env.REPRO_HOST as HostPlatform | undefined) ?? HostPlatfor
 const dir = pluginDirFor(host);
 
 const discovered = await discoverPlugins(host);
-const checked = await checkVersions(discovered, {
+const { records: checked } = await checkVersions(discovered, {
 	lookup: lookupNpmVersion,
 	cacheFile: cachePathFor(host),
 	ttlMs: -1,
@@ -36,7 +36,7 @@ if (!result.ok) {
 
 const after = await discoverPlugins(host);
 for (const r of after) console.log(`after   ${r.name} ${r.installed}`);
-const stale = checked.filter(isUpdateAvailable).filter((c) => {
+const stale = result.applied.filter((c) => {
 	const now = after.find((a) => a.name === c.name);
 	return now?.installed !== c.latest;
 });

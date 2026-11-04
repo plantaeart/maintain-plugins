@@ -16,6 +16,8 @@ export interface SkippedUpdate {
 
 export interface UpdatePlan {
 	updates: PluginUpdate[];
+	/** Stale plugins held back until this plugin has updated itself and reloaded. */
+	deferred: PluginUpdate[];
 	skipped: SkippedUpdate[];
 	byHost: Map<HostPlatform, PluginUpdate[]>;
 }

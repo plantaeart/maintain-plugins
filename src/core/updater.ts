@@ -21,8 +21,10 @@ import type {
  * fails, because a manifest pinned to a version that was never installed leaves
  * the host in a worse state than not having tried.
  *
- * ponytail: self-update is out of scope. A plugin cannot meaningfully roll back
- * the copy of itself that is currently executing.
+ * This plugin updates first, alone. A newer release may carry the fix for
+ * upgrading everything else, so the copy still in memory must not be the one
+ * that upgrades the rest: the others wait (`UpdatePlan.deferred`) until a
+ * reload has loaded the new code.
  */
 
 /**
@@ -51,6 +53,9 @@ const INSTALL: Record<
 	},
 };
 
+/** This plugin's own package name; a test pins it to package.json. */
+export const SELF_NAME = "maintain-plugins";
+
 export function buildUpdatePlan(records: PluginRecord[]): UpdatePlan {
 	const updates: PluginUpdate[] = [];
 	const skipped: UpdatePlan["skipped"] = [];
@@ -76,14 +81,18 @@ export function buildUpdatePlan(records: PluginRecord[]): UpdatePlan {
 		});
 	}
 
+	const self = updates.find((update) => update.name === SELF_NAME);
+	const planned = self ? [self] : updates;
+	const deferred = self ? updates.filter((update) => update !== self) : [];
+
 	const byHost = new Map<HostPlatform, PluginUpdate[]>();
-	for (const update of updates) {
+	for (const update of planned) {
 		const list = byHost.get(update.host) ?? [];
 		list.push(update);
 		byHost.set(update.host, list);
 	}
 
-	return { updates, skipped, byHost };
+	return { updates: planned, deferred, skipped, byHost };
 }
 
 export interface ApplyOptions {

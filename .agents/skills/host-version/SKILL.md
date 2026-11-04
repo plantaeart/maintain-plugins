@@ -48,7 +48,7 @@ The script greps these `name@version` strings; it does not keep its own copy. Ch
 1. **Check the release notes** for breaking extension-API changes. The `ExtensionContext` surface, `before_agent_start`, `registerCommand`, and the `pi.on` events are what this extension depends on. A major bump deserves a read before you install it.
 2. **Install locally** so you can test against the real host: edit `hostCLIs` in `flake.nix` to the new version, then reload the shell (a plain `npm install -g` would not win over the pinned copy on `PATH`):
    ```bash
-   nix-direnv-reload     # or re-enter `nix develop`
+   nix-direnv-reload     # or re-enter `nix develop .#e2e`
    ```
 3. **Run the suite on both hosts.** The matrix is the point — a host release can break one leg only:
    ```bash

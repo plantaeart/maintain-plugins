@@ -31,7 +31,7 @@ describe("checkVersions", () => {
 	it("fills in latest and flags only the genuinely stale plugins", async () => {
 		const latest: Record<string, string> = { stale: "2.0.0", current: "1.0.0" };
 
-		const result = await checkVersions([record("stale", "1.0.0"), record("current", "1.0.0")], {
+		const { records: result } = await checkVersions([record("stale", "1.0.0"), record("current", "1.0.0")], {
 			lookup: async (name) => latest[name],
 		});
 
@@ -42,7 +42,7 @@ describe("checkVersions", () => {
 	});
 
 	it("leaves latest undefined when the lookup fails, so no update is offered", async () => {
-		const result = await checkVersions([record("offline", "1.0.0")], {
+		const { records: result } = await checkVersions([record("offline", "1.0.0")], {
 			lookup: async () => {
 				throw new Error("registry unreachable");
 			},
@@ -55,7 +55,7 @@ describe("checkVersions", () => {
 	});
 
 	it("leaves latest undefined when the package is not on the registry", async () => {
-		const result = await checkVersions([record("gone", "1.0.0")], {
+		const { records: result } = await checkVersions([record("gone", "1.0.0")], {
 			lookup: async () => undefined,
 		});
 
@@ -63,7 +63,7 @@ describe("checkVersions", () => {
 	});
 
 	it("leaves latest undefined when the lookup returns something that is not a version", async () => {
-		const result = await checkVersions([record("weird", "1.0.0")], {
+		const { records: result } = await checkVersions([record("weird", "1.0.0")], {
 			lookup: async () => "" as string,
 		});
 
@@ -71,7 +71,7 @@ describe("checkVersions", () => {
 	});
 
 	it("does not throw when there are no plugins", async () => {
-		expect(await checkVersions([], { lookup: async () => "1.0.0" })).toEqual([]);
+		expect((await checkVersions([], { lookup: async () => "1.0.0" })).records).toEqual([]);
 	});
 });
 
@@ -116,7 +116,7 @@ describe("check cache", () => {
 
 		// An offline machine must still get a stale notice from the last known
 		// state rather than silently reporting nothing.
-		const offline = await checkVersions([record("stale", "1.0.0")], {
+		const { records: offline } = await checkVersions([record("stale", "1.0.0")], {
 			lookup: async () => {
 				throw new Error("offline");
 			},
@@ -131,13 +131,85 @@ describe("check cache", () => {
 		const cacheFile = path.join(tmp, "check.json");
 		await fs.writeFile(cacheFile, "{ not json");
 
-		const result = await checkVersions([record("stale", "1.0.0")], {
+		const { records: result } = await checkVersions([record("stale", "1.0.0")], {
 			lookup: async () => "2.0.0",
 			cacheFile,
 			ttlMs: 60_000,
 		});
 
 		expect(result[0].latest).toBe("2.0.0");
+	});
+});
+
+describe("forced check", () => {
+	const stale = () => [record("stale", "1.0.0")];
+
+	it("queries the registry even when the cache is fresh, and rewrites the cache", async () => {
+		const cacheFile = path.join(tmp, "check.json");
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000 });
+
+		const forced = await checkVersions(stale(), {
+			lookup: async () => "3.0.0",
+			cacheFile,
+			ttlMs: 60_000,
+			force: true,
+		});
+		expect(forced.records[0].latest).toBe("3.0.0");
+		expect(forced.live).toBe(true);
+
+		// The refresh must land in the cache, so the next plain check agrees with it.
+		const plain = await checkVersions(stale(), {
+			lookup: async () => {
+				throw new Error("must be served from cache");
+			},
+			cacheFile,
+			ttlMs: 60_000,
+		});
+		expect(plain.records[0].latest).toBe("3.0.0");
+	});
+
+	it("falls back to the cached version and says so when the registry is unreachable", async () => {
+		const cacheFile = path.join(tmp, "check.json");
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000, now: () => 1_000 });
+
+		const forced = await checkVersions(stale(), {
+			lookup: async () => {
+				throw new Error("offline");
+			},
+			cacheFile,
+			force: true,
+			now: () => 9_000,
+		});
+
+		expect(forced.records[0].latest).toBe("2.0.0");
+		expect(forced.live).toBe(false);
+		// The age of what is being shown, not of the failed attempt.
+		expect(forced.checkedAt).toBe(1_000);
+	});
+
+	it("reports a cache hit as not live, with the cache's own timestamp", async () => {
+		const cacheFile = path.join(tmp, "check.json");
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000, now: () => 1_000 });
+
+		const hit = await checkVersions(stale(), {
+			lookup: async () => "9.9.9",
+			cacheFile,
+			ttlMs: 60_000,
+			now: () => 2_000,
+		});
+
+		expect(hit.live).toBe(false);
+		expect(hit.checkedAt).toBe(1_000);
+	});
+
+	it("is not live when only some plugins answered", async () => {
+		const { live } = await checkVersions([record("up", "1.0.0"), record("down", "1.0.0")], {
+			lookup: async (name) => {
+				if (name === "down") throw new Error("offline");
+				return "2.0.0";
+			},
+		});
+		expect(live).toBe(false);
 	});
 });
 

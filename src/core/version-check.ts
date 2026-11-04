@@ -14,6 +14,16 @@ export interface CheckOptions {
 	ttlMs?: number;
 	/** Injectable clock, so TTL behaviour is deterministic under test. */
 	now?: () => number;
+	/** Query the registry even when the cache is fresh; the cache is rewritten. */
+	force?: boolean;
+}
+
+export interface CheckResult {
+	records: PluginRecord[];
+	/** True only when the registry answered for every plugin in this call. */
+	live: boolean;
+	/** When the versions shown were fetched; undefined when nothing is known. */
+	checkedAt?: number;
 }
 
 /**
@@ -31,21 +41,25 @@ export interface CheckOptions {
 export async function checkVersions(
 	records: PluginRecord[],
 	options: CheckOptions,
-): Promise<PluginRecord[]> {
-	const { lookup, cacheFile, ttlMs = DEFAULT_TTL_MS, now = Date.now } = options;
-	if (records.length === 0) return [];
+): Promise<CheckResult> {
+	const { lookup, cacheFile, ttlMs = DEFAULT_TTL_MS, now = Date.now, force = false } = options;
+	if (records.length === 0) return { records: [], live: true, checkedAt: now() };
 
 	const cache = await readCache(cacheFile);
 	const fresh = cache !== undefined && now() - cache.checkedAt < ttlMs;
 
-	if (fresh) {
-		return records.map((record) => ({ ...record, latest: cache.latest[record.name] }));
+	if (fresh && !force) {
+		return {
+			records: records.map((record) => ({ ...record, latest: cache.latest[record.name] })),
+			live: false,
+			checkedAt: cache.checkedAt,
+		};
 	}
 
 	// Any previously known version is a floor: if a lookup fails now, the last
 	// known value is still better than reporting nothing.
 	const known: Record<string, string> = { ...cache?.latest };
-	let queried = false;
+	let answered = 0;
 
 	const checked = await Promise.all(
 		records.map(async (record) => {
@@ -53,7 +67,7 @@ export async function checkVersions(
 				const latest = await lookup(record.name);
 				if (latest) {
 					known[record.name] = latest;
-					queried = true;
+					answered++;
 					return { ...record, latest };
 				}
 			} catch {
@@ -66,9 +80,13 @@ export async function checkVersions(
 
 	// Only stamp the cache when a lookup actually answered, so a total outage
 	// does not reset the clock and suppress checks for another full TTL.
-	if (queried) {
+	if (answered > 0) {
 		await writeCache(cacheFile, { checkedAt: now(), latest: known });
 	}
 
-	return checked;
+	return {
+		records: checked,
+		live: answered === records.length,
+		checkedAt: answered > 0 ? now() : cache?.checkedAt,
+	};
 }

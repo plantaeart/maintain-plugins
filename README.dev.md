@@ -278,6 +278,10 @@ The flags are independent, and `sandbox-test.sh use` prints both. The e2e suite 
 
 `discoverOmp` therefore verifies every entry against `node_modules/<pkg>/package.json` — the same authority `omp plugin list` uses, and the same rule `discoverPi` applies to `settings.json`. A manifest dependency with no lock entry is treated the same way: reported at its installed version, or skipped when nothing is on disk.
 
+### Faking a registry in tests
+
+`MAINTAIN_PLUGINS_REGISTRY` replaces `https://registry.npmjs.org` for the version lookup. The e2e suite starts a local `Bun.serve` that answers `GET /<name>/latest` and passes its URL here, so "a release was just published" is a fixture rather than whatever npm says today; `http://127.0.0.1:1` plays an unreachable registry. The installs themselves still go to the real npm.
+
 ### Removing a plugin
 
 `/maint-uninstall-plugin` takes no argument: it lists what is currently installed, each row labelled `name@version`, and asks a second time before deleting. Cancelling the picker is the answer, so there is no separate "never mind" path.

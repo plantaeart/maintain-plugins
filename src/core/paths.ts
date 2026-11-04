@@ -48,3 +48,8 @@ export function cachePathFor(host: HostPlatform, home: string = os.homedir()): s
 		"check.json",
 	);
 }
+
+/** The one-shot marker that lets a session continue an update across a reload. */
+export function continuePathFor(host: HostPlatform, home: string = os.homedir()): string {
+	return path.join(path.dirname(cachePathFor(host, home)), "continue.json");
+}

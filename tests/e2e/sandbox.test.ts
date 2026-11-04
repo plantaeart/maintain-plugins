@@ -65,7 +65,7 @@ class HostSession {
 	#stderr = "";
 	#cleared = new Map<string, number>();
 
-	constructor(bin: string, home: string, quiet: string[]) {
+	constructor(bin: string, home: string, quiet: string[], extraEnv: Record<string, string> = {}) {
 		this.#child = spawn(
 			bin,
 			[
@@ -82,7 +82,7 @@ class HostSession {
 			{
 				// HOME is what isolates; os.tmpdir() is only tidiness.
 				cwd: os.tmpdir(),
-				env: { ...process.env, HOME: home },
+				env: { ...process.env, HOME: home, ...extraEnv },
 				stdio: ["pipe", "pipe", "pipe"],
 			},
 		);
@@ -295,8 +295,7 @@ async function sha256(file: string): Promise<string> {
 async function seedInstalledPlugin(
 	home: string,
 	host: "omp" | "pi",
-	name: string,
-	version: string,
+	plugins: Record<string, string>,
 ): Promise<void> {
 	// Without a model the host refuses to start, and the extension never loads.
 	// `auth: none` is a declaration, not a credential: no request is ever made.
@@ -318,35 +317,75 @@ async function seedInstalledPlugin(
 		].join("\n"),
 	);
 
+	const names = Object.keys(plugins);
 	if (host === "omp") {
 		const dir = path.join(home, ".omp", "plugins");
-		await fs.mkdir(path.join(dir, "node_modules", name), { recursive: true });
+		await fs.mkdir(dir, { recursive: true });
 		await fs.writeFile(
 			path.join(dir, "package.json"),
-			JSON.stringify({ name: "omp-plugins", private: true, dependencies: { [name]: `npm:${name}@${version}` } }),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: Object.fromEntries(names.map((n) => [n, `npm:${n}@${plugins[n]}`])),
+			}),
 		);
 		await fs.writeFile(
 			path.join(dir, "omp-plugins.lock.json"),
-			JSON.stringify({ plugins: { [name]: { version, enabled: true } }, settings: {} }),
+			JSON.stringify({
+				plugins: Object.fromEntries(names.map((n) => [n, { version: plugins[n], enabled: true }])),
+				settings: {},
+			}),
 		);
-		await fs.writeFile(
-			path.join(dir, "node_modules", name, "package.json"),
-			JSON.stringify({ name, version }),
-		);
+		for (const name of names) {
+			await fs.mkdir(path.join(dir, "node_modules", name), { recursive: true });
+			await fs.writeFile(
+				path.join(dir, "node_modules", name, "package.json"),
+				JSON.stringify({ name, version: plugins[name] }),
+			);
+		}
 		return;
 	}
 	const agent = path.join(home, ".pi", "agent");
-	await fs.mkdir(path.join(agent, "npm", "node_modules", name), { recursive: true });
-	await fs.writeFile(path.join(agent, "settings.json"), JSON.stringify({ packages: [`npm:${name}`] }));
+	await fs.mkdir(path.join(agent, "npm"), { recursive: true });
+	await fs.writeFile(path.join(agent, "settings.json"), JSON.stringify({ packages: names.map((n) => `npm:${n}`) }));
 	await fs.writeFile(
 		path.join(agent, "npm", "package.json"),
-		JSON.stringify({ name: "pi-npm", private: true, dependencies: { [name]: version } }),
+		JSON.stringify({ name: "pi-npm", private: true, dependencies: plugins }),
 	);
-	await fs.writeFile(
-		path.join(agent, "npm", "node_modules", name, "package.json"),
-		JSON.stringify({ name, version }),
-	);
+	for (const name of names) {
+		await fs.mkdir(path.join(agent, "npm", "node_modules", name), { recursive: true });
+		await fs.writeFile(
+			path.join(agent, "npm", "node_modules", name, "package.json"),
+			JSON.stringify({ name, version: plugins[name] }),
+		);
+	}
 }
+
+/**
+ * A registry the test controls, so "a newer version was just published" is a
+ * fact of the fixture rather than of whatever npm says today.
+ */
+function startRegistry(latest: Record<string, string>) {
+	return Bun.serve({
+		port: 0,
+		fetch(request) {
+			const name = decodeURIComponent(new URL(request.url).pathname.split("/")[1] ?? "");
+			const version = latest[name];
+			return version ? Response.json({ version }) : new Response("not found", { status: 404 });
+		},
+	});
+}
+
+const registryEnv = (server: { port?: number }) => ({
+	MAINTAIN_PLUGINS_REGISTRY: `http://127.0.0.1:${server.port}`,
+});
+/** Nothing listens on port 1: the registry is unreachable. */
+const DEAD_REGISTRY = { MAINTAIN_PLUGINS_REGISTRY: "http://127.0.0.1:1" };
+
+/** This plugin's own name, a stale copy of it, and a real published release newer than that. */
+const SELF = "maintain-plugins";
+const SELF_PIN = "0.3.0";
+const SELF_LATEST = "0.4.1";
 
 /**
  * Pretend a registry check just ran, so the version comparison costs no
@@ -368,7 +407,7 @@ describe("sandbox e2e", () => {
 		describe(testCase.host, () => {
 			let sandbox = "";
 			let session: HostSession | undefined;
-
+			let registry: Bun.Server<undefined> | undefined;
 			beforeAll(async () => {
 				if (Bun.spawnSync(["sh", "-c", `command -v ${testCase.bin}`]).exitCode !== 0) return;
 				// os.tmpdir() rather than the skill's default: a test must not share
@@ -403,10 +442,14 @@ describe("sandbox e2e", () => {
 				// assertion exact and removes the request that a slow runner would
 				// otherwise spend the frame budget on.
 				await seedCheckCache(sandbox, testCase.host, { [PACKAGE]: LATEST });
+				// The forced check on /maint-update-all queries the registry, so the
+				// version it resolves to is pinned here rather than read from npm.
+				registry = startRegistry({ [PACKAGE]: LATEST });
 			});
 
 			afterAll(async () => {
 				session?.close();
+				registry?.stop(true);
 				if (sandbox !== "") await fs.rm(sandbox, { recursive: true, force: true });
 			});
 
@@ -424,7 +467,7 @@ describe("sandbox e2e", () => {
 					// pi pins a bare version, omp an `npm:` spec; both name the pin.
 					expect(seeded).toContain(PIN);
 
-					session = new HostSession(testCase.bin, sandbox, [...testCase.quiet]);
+					session = new HostSession(testCase.bin, sandbox, [...testCase.quiet], registryEnv(registry!));
 
 					// The startup notice is a widget, not a notify: notify("info")
 					// lands on a replaceable status line that another plugin can clobber,
@@ -468,22 +511,25 @@ describe("sandbox e2e", () => {
 					// timer so it animates instead of looking frozen.
 					await session.widget(/Updating 1\/1/, "the progress widget");
 					expect(await session.widget(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ⬆️ Updating/, "the spinner frame"));
-					expect(await session.uncachedNotify(/Updated 1 plugin\(s\)/, "the applied update")).toContain(
-						`⬆️ ${PACKAGE} ->`,
-					);
+					const applied = await session.uncachedNotify(/Updated 1 plugin\(s\)/, "the applied update");
+					expect(applied).toContain(`⬆️ ${PACKAGE} ->`);
 					// An install takes seconds with nothing else on screen; the row
 					// must be cleared once it is over, not left behind forever.
 					expect(await session.widgetCleared("maintain-plugins-progress")).toBe(true);
 
-					// The session still holds the old plugin code until it reloads,
-					// and the dialog has to say which plugins it would activate -
-					// the question is "what am I about to reload", not "how many".
-					const reloadPrompt = await session.confirm(false, "the reload offer");
-					expect(reloadPrompt).toBe("Reload now?");
-					expect(session.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
-					expect(session.lastConfirmMessage).toContain(
-						testCase.host === "omp" ? "/reload-plugins" : "/reload",
-					);
+					// The session still holds the old plugin code until it is restarted
+					// (omp) or reloaded (pi). omp's own reload only re-opens the session
+					// file, so it is not offered there; asking for it would promise
+					// something the host does not do.
+					if (testCase.host === "omp") {
+						expect(applied).toContain("Restart omp");
+					} else {
+						// The dialog has to say which plugins it would activate -
+						// the question is "what am I about to reload", not "how many".
+						expect(await session.confirm(false, "the reload offer")).toBe("Reload now?");
+						expect(session.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
+						expect(session.lastConfirmMessage).toContain("/reload");
+					}
 
 					// The notice listed exactly what was just applied, so it clears
 					// itself rather than claiming updates that no longer exist.
@@ -537,7 +583,7 @@ describe("sandbox e2e", () => {
 					// frame budget on a network round trip.
 					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-uninstall-"));
 					registerTestSandbox(dir);
-					await seedInstalledPlugin(dir, testCase.host, PACKAGE, PIN);
+					await seedInstalledPlugin(dir, testCase.host, { [PACKAGE]: PIN });
 					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet]);
 					try {
 						const realBefore = await sha256(testCase.realManifest());
@@ -569,6 +615,154 @@ describe("sandbox e2e", () => {
 					}
 				},
 				180_000,
+			);
+
+			it(
+				"refreshes on /maint-updates-check even when a fresh cache says everything is current",
+				async () => {
+					if (sandbox === "") {
+						console.warn(`skipping ${testCase.host} e2e: '${testCase.bin}' is not on PATH`);
+						return;
+					}
+					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-refresh-"));
+					registerTestSandbox(dir);
+					await seedInstalledPlugin(dir, testCase.host, { [PACKAGE]: PIN });
+					// A release published after the cache was written: the cache is
+					// still inside its TTL and says there is nothing to do.
+					await seedCheckCache(dir, testCase.host, { [PACKAGE]: PIN });
+					const newer = startRegistry({ [PACKAGE]: LATEST });
+					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
+					try {
+						fresh.run("/maint-updates-check");
+						const report = await fresh.uncachedNotify(/installed, \d+ update/, "the refreshed report");
+						expect(report).toContain("1 update available");
+						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
+						expect(report).toContain("/maint-update-all");
+					} finally {
+						fresh.close();
+						newer.stop(true);
+					}
+				},
+				180_000,
+			);
+
+			it(
+				"checks the registry by itself when a session starts, whatever the cache says",
+				async () => {
+					if (sandbox === "") {
+						console.warn(`skipping ${testCase.host} e2e: '${testCase.bin}' is not on PATH`);
+						return;
+					}
+					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-startup-"));
+					registerTestSandbox(dir);
+					await seedInstalledPlugin(dir, testCase.host, { [PACKAGE]: PIN });
+					// Inside its TTL and claiming nothing is stale: only a refresh at
+					// session start can show the release published since.
+					await seedCheckCache(dir, testCase.host, { [PACKAGE]: PIN });
+					const newer = startRegistry({ [PACKAGE]: LATEST });
+					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
+					try {
+						const notice = await fresh.widget(/plugin update.* available/, "the startup notice");
+						expect(notice).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
+					} finally {
+						fresh.close();
+						newer.stop(true);
+					}
+				},
+				180_000,
+			);
+
+			it(
+				"says when /maint-updates-check is showing cached versions because the registry is unreachable",
+				async () => {
+					if (sandbox === "") {
+						console.warn(`skipping ${testCase.host} e2e: '${testCase.bin}' is not on PATH`);
+						return;
+					}
+					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-offline-"));
+					registerTestSandbox(dir);
+					await seedInstalledPlugin(dir, testCase.host, { [PACKAGE]: PIN });
+					await seedCheckCache(dir, testCase.host, { [PACKAGE]: LATEST });
+					const offline = new HostSession(testCase.bin, dir, [...testCase.quiet], DEAD_REGISTRY);
+					try {
+						offline.run("/maint-updates-check");
+						const report = await offline.uncachedNotify(/installed, \d+ update/, "the cached report");
+						expect(report).toMatch(/could not reach the registry/i);
+						expect(report).toContain("cached");
+						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
+						expect(report).toContain("/maint-update-all");
+					} finally {
+						offline.close();
+					}
+				},
+				180_000,
+			);
+
+			it(
+				"updates itself first, reloads, then offers the remaining plugins",
+				async () => {
+					if (sandbox === "") {
+						console.warn(`skipping ${testCase.host} e2e: '${testCase.bin}' is not on PATH`);
+						return;
+					}
+					const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-self-"));
+					registerTestSandbox(dir);
+					await seedInstalledPlugin(dir, testCase.host, { [PACKAGE]: PIN, [SELF]: SELF_PIN });
+					const newer = startRegistry({ [PACKAGE]: LATEST, [SELF]: SELF_LATEST });
+					const fresh = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
+					const installed = (name: string) =>
+						fs
+							.readFile(path.join(testCase.pluginDir(dir), "node_modules", name, "package.json"), "utf8")
+							.then((raw) => JSON.parse(raw).version as string);
+					let restarted: HostSession | undefined;
+					try {
+						// This plugin leads the startup notice: it is what gets updated first.
+						const notice = await fresh.widget(/plugin updates? available/, "the startup notice");
+						expect(notice).toContain(`⬆️ ${SELF}: ${SELF_PIN} -> ${SELF_LATEST}`);
+						expect(notice.indexOf(SELF)).toBeLessThan(notice.indexOf(PACKAGE));
+
+						fresh.run("/maint-update-all");
+						expect(await fresh.confirm(true, "the self-update confirmation")).toBe("Update all plugins?");
+						// The dialog names the plugin going now and the one that waits.
+						expect(fresh.lastConfirmMessage).toContain(`⬆️ ${SELF}: ${SELF_PIN} -> ${SELF_LATEST}`);
+						expect(fresh.lastConfirmMessage).toContain(
+							testCase.host === "omp" ? "after the restart" : "after the reload",
+						);
+						expect(fresh.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
+
+						const applied = await fresh.uncachedNotify(/Updated 1 plugin\(s\)/, "the self-update");
+						expect(await installed(SELF)).toBe(SELF_LATEST);
+
+						// pi reloads in-process. omp cannot load new plugin code into a
+						// running session, so it asks for a restart: a second host process
+						// on the same HOME, which finds the marker the first one left.
+						let next = fresh;
+						if (testCase.host === "pi") {
+							expect(await fresh.confirm(true, "the reload offer")).toBe("Reload now?");
+						} else {
+							expect(applied).toContain("Restart omp");
+							expect(applied).toContain("remaining 1 plugin(s)");
+							fresh.close();
+							next = restarted = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
+						}
+
+						// The new session picks the rest up on its own. Only the other
+						// plugin is in it: this one is already current.
+						expect(await next.confirm(true, "the continued update")).toBe("Update all plugins?");
+						expect(next.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
+						expect(next.lastConfirmMessage).not.toContain(`${SELF}:`);
+
+						const done = await next.uncachedNotify(/Updated 1 plugin\(s\)/, "the second update");
+						expect(done).toContain(`⬆️ ${PACKAGE} -> ${LATEST}`);
+						expect(done).toContain(testCase.host === "omp" ? "Restart omp" : "/reload");
+						expect(await installed(PACKAGE)).toBe(LATEST);
+					} finally {
+						fresh.close();
+						restarted?.close();
+						newer.stop(true);
+					}
+				},
+				240_000,
 			);
 		});
 	}

@@ -76,130 +76,51 @@ describe("checkVersions", () => {
 });
 
 describe("check cache", () => {
-	it("reuses a cached result inside the TTL instead of querying again", async () => {
+	const stale = () => [record("stale", "1.0.0")];
+
+	it("asks the registry every time, so a release published since the last check shows up", async () => {
 		const cacheFile = path.join(tmp, "check.json");
-		let calls = 0;
-		const lookup = async () => {
-			calls++;
-			return "2.0.0";
-		};
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile });
 
-		await checkVersions([record("stale", "1.0.0")], { lookup, cacheFile, ttlMs: 60_000 });
-		await checkVersions([record("stale", "1.0.0")], { lookup, cacheFile, ttlMs: 60_000 });
+		const second = await checkVersions(stale(), { lookup: async () => "3.0.0", cacheFile });
 
-		// The second call is served from disk, which is the whole point: a
-		// registry hit on every session start is the cost being avoided.
-		expect(calls).toBe(1);
+		expect(second.records[0].latest).toBe("3.0.0");
+		expect(second.live).toBe(true);
 	});
 
-	it("re-queries once the TTL has expired", async () => {
+	it("writes what it found, so the next unreachable check can fall back to it", async () => {
 		const cacheFile = path.join(tmp, "check.json");
-		let calls = 0;
-		const lookup = async () => {
-			calls++;
-			return "2.0.0";
-		};
-
-		await checkVersions([record("stale", "1.0.0")], { lookup, cacheFile, ttlMs: 60_000 });
-		await checkVersions([record("stale", "1.0.0")], { lookup, cacheFile, ttlMs: -1 });
-
-		expect(calls).toBe(2);
-	});
-
-	it("surfaces cached results when the network is unavailable", async () => {
-		const cacheFile = path.join(tmp, "check.json");
-		await checkVersions([record("stale", "1.0.0")], {
-			lookup: async () => "2.0.0",
-			cacheFile,
-			ttlMs: -1,
-		});
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile });
+		await checkVersions(stale(), { lookup: async () => "3.0.0", cacheFile });
 
 		// An offline machine must still get a stale notice from the last known
 		// state rather than silently reporting nothing.
-		const { records: offline } = await checkVersions([record("stale", "1.0.0")], {
+		const offline = await checkVersions(stale(), {
 			lookup: async () => {
 				throw new Error("offline");
 			},
 			cacheFile,
-			ttlMs: 60_000,
 		});
 
-		expect(offline[0].latest).toBe("2.0.0");
+		expect(offline.records[0].latest).toBe("3.0.0");
 	});
 
-	it("ignores a corrupt cache file rather than failing the check", async () => {
+	it("says the answer is cached, and how old it is, when the registry is unreachable", async () => {
 		const cacheFile = path.join(tmp, "check.json");
-		await fs.writeFile(cacheFile, "{ not json");
+		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, now: () => 1_000 });
 
-		const { records: result } = await checkVersions([record("stale", "1.0.0")], {
-			lookup: async () => "2.0.0",
-			cacheFile,
-			ttlMs: 60_000,
-		});
-
-		expect(result[0].latest).toBe("2.0.0");
-	});
-});
-
-describe("forced check", () => {
-	const stale = () => [record("stale", "1.0.0")];
-
-	it("queries the registry even when the cache is fresh, and rewrites the cache", async () => {
-		const cacheFile = path.join(tmp, "check.json");
-		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000 });
-
-		const forced = await checkVersions(stale(), {
-			lookup: async () => "3.0.0",
-			cacheFile,
-			ttlMs: 60_000,
-			force: true,
-		});
-		expect(forced.records[0].latest).toBe("3.0.0");
-		expect(forced.live).toBe(true);
-
-		// The refresh must land in the cache, so the next plain check agrees with it.
-		const plain = await checkVersions(stale(), {
-			lookup: async () => {
-				throw new Error("must be served from cache");
-			},
-			cacheFile,
-			ttlMs: 60_000,
-		});
-		expect(plain.records[0].latest).toBe("3.0.0");
-	});
-
-	it("falls back to the cached version and says so when the registry is unreachable", async () => {
-		const cacheFile = path.join(tmp, "check.json");
-		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000, now: () => 1_000 });
-
-		const forced = await checkVersions(stale(), {
+		const offline = await checkVersions(stale(), {
 			lookup: async () => {
 				throw new Error("offline");
 			},
 			cacheFile,
-			force: true,
 			now: () => 9_000,
 		});
 
-		expect(forced.records[0].latest).toBe("2.0.0");
-		expect(forced.live).toBe(false);
-		// The age of what is being shown, not of the failed attempt.
-		expect(forced.checkedAt).toBe(1_000);
-	});
-
-	it("reports a cache hit as not live, with the cache's own timestamp", async () => {
-		const cacheFile = path.join(tmp, "check.json");
-		await checkVersions(stale(), { lookup: async () => "2.0.0", cacheFile, ttlMs: 60_000, now: () => 1_000 });
-
-		const hit = await checkVersions(stale(), {
-			lookup: async () => "9.9.9",
-			cacheFile,
-			ttlMs: 60_000,
-			now: () => 2_000,
-		});
-
-		expect(hit.live).toBe(false);
-		expect(hit.checkedAt).toBe(1_000);
+		expect(offline.live).toBe(false);
+		// The age of what is being shown, not of the failed attempt, and a total
+		// outage does not reset the clock.
+		expect(offline.checkedAt).toBe(1_000);
 	});
 
 	it("is not live when only some plugins answered", async () => {
@@ -210,6 +131,18 @@ describe("forced check", () => {
 			},
 		});
 		expect(live).toBe(false);
+	});
+
+	it("ignores a corrupt cache file rather than failing the check", async () => {
+		const cacheFile = path.join(tmp, "check.json");
+		await fs.writeFile(cacheFile, "{ not json");
+
+		const { records: result } = await checkVersions(stale(), {
+			lookup: async () => "2.0.0",
+			cacheFile,
+		});
+
+		expect(result[0].latest).toBe("2.0.0");
 	});
 });
 

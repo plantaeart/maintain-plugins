@@ -15,7 +15,6 @@ const discovered = await discoverPlugins(host);
 const { records: checked } = await checkVersions(discovered, {
 	lookup: lookupNpmVersion,
 	cacheFile: cachePathFor(host),
-	ttlMs: -1,
 });
 
 for (const r of checked) {

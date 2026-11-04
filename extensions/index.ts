@@ -10,6 +10,7 @@ import { cachePathFor, continuePathFor, detectHost, pluginDirFor } from "../src/
 import { RUNNING_VERSION, reloadPending } from "../src/core/self";
 import { uninstallPlugin } from "../src/core/uninstall";
 import { SELF_NAME, applyUpdates, buildUpdatePlan } from "../src/core/updater";
+import { armRestart, restartCommand } from "../src/core/restart";
 import { checkVersions, type CheckResult } from "../src/core/version-check";
 import { clearContinue, consumeContinue, markContinue } from "../src/ports/continue.port";
 import { lookupNpmVersion } from "../src/ports/registry.port";
@@ -86,7 +87,6 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 			const result = await checkVersions(discovered, {
 				lookup: lookupNpmVersion,
 				cacheFile,
-				force: true,
 			});
 			// This plugin first everywhere it is listed: it is what updates first.
 			result.records.sort((a, b) => Number(b.name === SELF_NAME) - Number(a.name === SELF_NAME));
@@ -193,17 +193,67 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		ctx.ui.setWidget(NOTICE_WIDGET_KEY, undefined);
 	};
 
-	/** How to say "make the new plugin code take effect" on this host. */
-	const restartHint = host === HostPlatform.Omp ? "Restart omp" : "Run /reload";
+	/** The command that makes new plugin code take effect, per host. */
+	const activateCommand = host === HostPlatform.Omp ? "/restart" : "/reload";
+
+	/**
+	 * How long after asking omp to shut down its exit still counts as that shutdown.
+	 * A later exit is the user quitting after a refused shutdown, not a restart.
+	 */
+	const RESTART_GRACE_MS = 15_000;
+
+	/**
+	 * omp only: restart in place, the way its own `/restart` does.
+	 *
+	 * omp's `ctx.reload()` merely re-opens the session file and `/reload-plugins`
+	 * does not re-run an extension, and neither `/restart` nor `/reload-plugins`
+	 * can be sent from an extension (`sendUserMessage` hands the text to the
+	 * model; verified in the TUI). What an extension can do is `shutdown()`,
+	 * which runs omp's normal teardown and restores the terminal, then replace
+	 * the exiting process with the same command line plus `--resume <session>`:
+	 * the same pid, the same terminal, the same conversation.
+	 *
+	 * Undefined when the launch line cannot be rebuilt without guessing, or when
+	 * the conversation is not saved and a restart would drop it; the caller then
+	 * tells the user to run `/restart` themselves.
+	 */
+	function ompRestart(ctx: ExtensionContext): (() => void) | undefined {
+		// Only the terminal UI: under rpc, print and json shutdown() does not end the
+		// host, so a restart there would hang with the new plugin code never loaded.
+		if (ctx.mode !== "tui") return undefined;
+		const session: typeof ctx.sessionManager & { isSessionOnDisk?: () => boolean } = ctx.sessionManager;
+		const unsaved = session.isSessionOnDisk?.() === false;
+		const command = restartCommand({
+			execPath: process.execPath,
+			argv: process.argv,
+			execArgv: process.execArgv,
+			sessionFile: unsaved ? undefined : session.getSessionFile(),
+			// `--no-session` after real chat: there is nothing to resume, so a
+			// restart would greet the user with an empty session.
+			unsavedConversation: unsaved && session.getEntries().length > 0,
+		});
+		if (command === undefined) return undefined;
+		// The runtime has process.execve (Node and Bun); bun-types does not declare it.
+		const runtime = process as unknown as { execve(file: string, args: string[], env: object): never };
+		return () => {
+			armRestart(command, RESTART_GRACE_MS, {
+				now: Date.now,
+				onExit: (callback) => process.once("exit", callback),
+				exec: (relaunch) => runtime.execve(relaunch[0], relaunch, process.env),
+				fail: (message) => process.stderr.write(`${message}\n`),
+			});
+			// Like omp's own /restart, an agent turn still in flight is abandoned:
+			// shutdown() does not finish while it streams or retries.
+			ctx.abort();
+			ctx.shutdown();
+		};
+	}
 
 	/**
 	 * The whole update flow, shared by the command and by the session that
 	 * continues it after this plugin updated itself.
 	 *
-	 * `reload` is only honoured on pi, whose reload re-runs every extension. omp's
-	 * `ctx.reload()` merely re-opens the session file and leaves plugin code in
-	 * memory, and no extension can run omp's `/reload-plugins` (a user message
-	 * goes to the model), so omp updates take effect on the next start.
+	 * `reload` is only honoured on pi, whose reload re-runs every extension.
 	 */
 	async function updateAll(ctx: ExtensionContext, reload?: () => Promise<void>): Promise<void> {
 		const { records: checked } = await check();
@@ -221,7 +271,7 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		if (ahead !== undefined) {
 			ctx.ui.notify(
 				`⚠️ ${SELF_NAME} ${ahead} is installed but ${RUNNING_VERSION} is still running. ` +
-					`${restartHint} so the new update logic is the one in use.`,
+					`Run ${activateCommand} so the new update logic is the one in use.`,
 				"warning",
 			);
 		}
@@ -294,39 +344,44 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 		// dismissNotice, not a bare clear, so the expiry is cancelled with it.
 		dismissNotice(ctx);
 		const hotReload = host === HostPlatform.Pi ? reload : undefined;
+		const restart = host === HostPlatform.Omp ? ompRestart(ctx) : undefined;
+		const activate = hotReload ?? restart;
 		// Written when the rest has to wait for new code: the session that starts
 		// next carries on with it. On pi that is after the reload below, so it is
-		// written there, once the user has said yes.
+		// written there, once the user has said yes; on omp it is written now, so a
+		// manual /restart carries on as well as the one offered below.
 		if (plan.deferred.length > 0 && !hotReload) await markContinue(continueFile, ctx.cwd);
 		ctx.ui.notify(
 			`✅ Updated ${result.applied.length} plugin(s):\n` +
 				result.applied.map((u) => `  ⬆️ ${u.name} -> ${u.latest}`).join("\n") +
-				(hotReload
+				(activate
 					? ""
-					: `\n\n${restartHint} to load ${result.applied.length === 1 ? "it" : "them"}.` +
+					: `\n\nRun ${activateCommand} to load ${result.applied.length === 1 ? "it" : "them"}.` +
 						(plan.deferred.length > 0
 							? ` The remaining ${plan.deferred.length} plugin(s) are offered for update on that start.`
 							: "")),
 			"info",
 		);
-		if (!hotReload) return;
+		if (!activate) return;
 
 		// The running session still holds the old plugin code: the extension
 		// in memory, and every other extension that session started. Only a
-		// reload picks up what was just written to disk. The dialog names each
-		// plugin, because the whole point of the question is "what am I about
-		// to reload", and a bare count answers nothing.
+		// reload (pi) or a restart (omp) picks up what was just written to disk.
+		// The dialog names each plugin, because the whole point of the question
+		// is "what am I about to load", and a bare count answers nothing.
+		const omp = host === HostPlatform.Omp;
 		const reloading = result.applied.map((u) => `  ${staleRow(u)}`).join("\n");
 		const next =
 			plan.deferred.length > 0
-				? `\n\nAfter the reload, the remaining ${plan.deferred.length} plugin(s) are offered for update.`
+				? `\n\nAfter the ${omp ? "restart" : "reload"}, the remaining ${plan.deferred.length} plugin(s) are offered for update.`
 				: "";
-		const reloadNow = await ctx.ui.confirm(
-			"Reload now?",
-			`${result.applied.length} plugin(s) updated. Reloading activates:\n${reloading}${next}\n\n` +
-				`Or run /reload yourself later.`,
+		const activateNow = await ctx.ui.confirm(
+			omp ? "Restart now?" : "Reload now?",
+			`${result.applied.length} plugin(s) updated. ${omp ? "Restarting keeps this session and activates" : "Reloading activates"}:\n${reloading}${next}\n\n` +
+				`Or run ${activateCommand} yourself later.`,
 		);
-		if (reloadNow) {
+		if (!activateNow) return;
+		if (hotReload) {
 			if (plan.deferred.length > 0) await markContinue(continueFile, ctx.cwd);
 			try {
 				await hotReload();
@@ -338,6 +393,8 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 					"warning",
 				);
 			}
+		} else {
+			restart?.();
 		}
 	}
 

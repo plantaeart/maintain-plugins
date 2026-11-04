@@ -250,8 +250,16 @@ class HostSession {
 		}
 	}
 
-	close() {
+	/**
+	 * Stop the host and wait until it has exited. A host still shutting down
+	 * writes back into its HOME, so deleting that HOME has to wait for this.
+	 */
+	async close(): Promise<void> {
+		if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#child.once("exit", () => resolve());
 		this.#child.kill("SIGTERM");
+		await promise;
 	}
 }
 
@@ -448,7 +456,7 @@ describe("sandbox e2e", () => {
 			});
 
 			afterAll(async () => {
-				session?.close();
+				await session?.close();
 				registry?.stop(true);
 				if (sandbox !== "") await fs.rm(sandbox, { recursive: true, force: true });
 			});
@@ -517,15 +525,13 @@ describe("sandbox e2e", () => {
 					// must be cleared once it is over, not left behind forever.
 					expect(await session.widgetCleared("maintain-plugins-progress")).toBe(true);
 
-					// The session still holds the old plugin code until it is restarted
-					// (omp) or reloaded (pi). omp's own reload only re-opens the session
-					// file, so it is not offered there; asking for it would promise
-					// something the host does not do.
+					// The session still holds the old plugin code until pi reloads or omp
+					// restarts. pi asks, naming each plugin it would activate. omp can
+					// only restart itself from a terminal (under rpc, shutdown() does not
+					// end the host), so here it says which command to run.
 					if (testCase.host === "omp") {
-						expect(applied).toContain("Restart omp");
+						expect(applied).toContain("Run /restart to load it");
 					} else {
-						// The dialog has to say which plugins it would activate -
-						// the question is "what am I about to reload", not "how many".
 						expect(await session.confirm(false, "the reload offer")).toBe("Reload now?");
 						expect(session.lastConfirmMessage).toContain(`⬆️ ${PACKAGE}: ${PIN} ->`);
 						expect(session.lastConfirmMessage).toContain("/reload");
@@ -611,7 +617,11 @@ describe("sandbox e2e", () => {
 						expect(await fs.readFile(manifestPath, "utf8")).not.toContain(PACKAGE);
 						expect(await sha256(testCase.realManifest())).toBe(realBefore);
 					} finally {
-						fresh.close();
+						// Deleted here rather than by the global teardown: each omp HOME
+						// holds the host's natives, and the teardown has one 5 s budget
+						// for all of them.
+						await fresh.close();
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -639,8 +649,9 @@ describe("sandbox e2e", () => {
 						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 						expect(report).toContain("/maint-update-all");
 					} finally {
-						fresh.close();
+						await fresh.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -665,8 +676,9 @@ describe("sandbox e2e", () => {
 						const notice = await fresh.widget(/plugin update.* available/, "the startup notice");
 						expect(notice).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 					} finally {
-						fresh.close();
+						await fresh.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -692,7 +704,8 @@ describe("sandbox e2e", () => {
 						expect(report).toContain(`⬆️ ${PACKAGE}: ${PIN} -> ${LATEST}`);
 						expect(report).toContain("/maint-update-all");
 					} finally {
-						offline.close();
+						await offline.close();
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				180_000,
@@ -733,16 +746,16 @@ describe("sandbox e2e", () => {
 						const applied = await fresh.uncachedNotify(/Updated 1 plugin\(s\)/, "the self-update");
 						expect(await installed(SELF)).toBe(SELF_LATEST);
 
-						// pi reloads in-process. omp cannot load new plugin code into a
-						// running session, so it asks for a restart: a second host process
-						// on the same HOME, which finds the marker the first one left.
+						// pi reloads in-process. Under rpc, omp cannot restart itself, so the
+						// second host process on the same HOME stands in for the user's
+						// /restart and finds the marker the first one left.
 						let next = fresh;
 						if (testCase.host === "pi") {
 							expect(await fresh.confirm(true, "the reload offer")).toBe("Reload now?");
 						} else {
-							expect(applied).toContain("Restart omp");
+							expect(applied).toContain("Run /restart to load it");
 							expect(applied).toContain("remaining 1 plugin(s)");
-							fresh.close();
+							await fresh.close();
 							next = restarted = new HostSession(testCase.bin, dir, [...testCase.quiet], registryEnv(newer));
 						}
 
@@ -754,16 +767,189 @@ describe("sandbox e2e", () => {
 
 						const done = await next.uncachedNotify(/Updated 1 plugin\(s\)/, "the second update");
 						expect(done).toContain(`⬆️ ${PACKAGE} -> ${LATEST}`);
-						expect(done).toContain(testCase.host === "omp" ? "Restart omp" : "/reload");
+						expect(done).toContain(testCase.host === "omp" ? "Run /restart to load it" : "/reload");
 						expect(await installed(PACKAGE)).toBe(LATEST);
 					} finally {
-						fresh.close();
-						restarted?.close();
+						await fresh.close();
+						await restarted?.close();
 						newer.stop(true);
+						await fs.rm(dir, { recursive: true, force: true });
 					}
 				},
 				240_000,
 			);
 		});
 	}
+});
+
+/**
+ * omp's in-place restart only exists in the terminal UI: under rpc, shutdown()
+ * does not end the host, so no rpc test can show it. This drives the real
+ * terminal through tmux instead, and skips when tmux or omp is missing.
+ */
+describe("omp terminal restart", () => {
+	const hasTools = ["omp", "tmux"].every((bin) => Bun.spawnSync(["sh", "-c", `command -v ${bin}`]).exitCode === 0);
+
+	const tmux = (...args: string[]) => Bun.spawnSync(["tmux", ...args]).stdout.toString();
+
+	/**
+	 * Poll until `check` holds. The delay between polls is the only real timer
+	 * here: the screen of another process raises no event to await, and the
+	 * deadline is a guard against a hang, not synchronisation.
+	 */
+	async function until(check: () => boolean | Promise<boolean>, what: string, describeState: () => string, timeoutMs = 120_000) {
+		const deadline = Date.now() + timeoutMs;
+		while (!(await check())) {
+			if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}.\n${describeState()}`);
+			await Bun.sleep(250);
+		}
+	}
+	/** A terminal omp in a sandbox HOME with a stale `maintain-plugins` and a stale `system-prompt-switch`. */
+	async function launch(extraFlags: string[]) {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-tui-"));
+		const project = await fs.mkdtemp(path.join(os.tmpdir(), "maint-e2e-tui-proj-"));
+		registerTestSandbox(home);
+		registerTestSandbox(project);
+		await seedInstalledPlugin(home, "omp", { [PACKAGE]: PIN, [SELF]: SELF_PIN });
+		// A prompt is sent so that the session holds a conversation; point the
+		// model at a closed port so that costs no network or money.
+		const models = path.join(home, ".omp", "agent", "models.yml");
+		await fs.writeFile(models, (await fs.readFile(models, "utf8")).replace("https://api.openai.com/v1", "http://127.0.0.1:1/v1"));
+		const registry = startRegistry({ [PACKAGE]: LATEST, [SELF]: SELF_LATEST });
+		const session = `maint-e2e-${process.pid}-${extraFlags.length}`;
+		const quote = (value: string) => `'${value}'`;
+		tmux(
+			"new-session", "-d", "-s", session, "-x", "150", "-y", "50", "-c", project,
+			[
+				"env", `HOME=${quote(home)}`, `MAINTAIN_PLUGINS_REGISTRY=http://127.0.0.1:${registry.port}`,
+				"omp", "--no-skills", "--no-rules", "--no-extensions", ...extraFlags,
+				"-e", quote(path.join(REPO_ROOT, "extensions/index.ts")),
+			].join(" "),
+		);
+		// `env` execs omp, so the pane's process is omp itself, and an in-place
+		// restart keeps that pid.
+		const pid = Number(tmux("display-message", "-p", "-t", session, "#{pane_pid}").trim());
+		const alive = () => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const screen = () => tmux("capture-pane", "-t", session, "-p");
+		return {
+			screen,
+			send: (...keys: string[]) => tmux("send-keys", "-t", session, ...keys),
+			waitScreen: async (match: RegExp, what: string) => {
+				await until(() => match.test(screen()), what, () => `screen:\n${screen().slice(-800)}`);
+				return screen();
+			},
+			/** True once a session file on disk holds the message: only then can omp resume it. */
+			messageSaved: async () => {
+				const root = path.join(home, ".omp", "agent", "sessions");
+				const entries = await fs.readdir(root, { recursive: true }).catch(() => []);
+				for (const entry of entries.filter((name) => name.endsWith(".jsonl"))) {
+					if ((await fs.readFile(path.join(root, entry), "utf8")).includes("hello e2e")) return true;
+				}
+				return false;
+			},
+			installed: (name: string) =>
+				fs
+					.readFile(path.join(home, ".omp", "plugins", "node_modules", name, "package.json"), "utf8")
+					.then((raw) => JSON.parse(raw).version as string),
+			markerFile: path.join(home, ".omp", "agent", "state", "maintain-plugins", "continue.json"),
+			describeScreen: () => `screen:\n${screen().slice(-800)}`,
+			close: async () => {
+				tmux("kill-session", "-t", session);
+				// A host still shutting down writes back into its HOME.
+				await until(() => !alive(), "omp to exit", () => `pid ${pid} still running`);
+				registry.stop(true);
+				await fs.rm(home, { recursive: true, force: true });
+				await fs.rm(project, { recursive: true, force: true });
+			},
+		};
+	}
+
+	const exists = (file: string) => fs.access(file).then(() => true, () => false);
+
+	it(
+		"restarts omp in place into the same session and carries on with the remaining plugins",
+		async () => {
+			if (!hasTools) {
+				console.warn("skipping omp terminal restart: 'omp' or 'tmux' is not on PATH");
+				return;
+			}
+			const tui = await launch([]);
+			try {
+				await tui.waitScreen(/2 plugin updates available/, "the startup notice");
+
+				// Saved only once there is a message; without one there is nothing to resume.
+				tui.send("hello e2e", "Enter");
+				await until(tui.messageSaved, "the message to be saved", tui.describeScreen);
+				// The reply fails at once (closed port). A command typed while the
+				// agent is still working is queued as a steering message instead of run.
+				await until(() => !/Working/.test(tui.screen()), "the agent to go idle", tui.describeScreen);
+
+				tui.send("/maint-update-all", "Enter");
+				const first = await tui.waitScreen(/Update all plugins\?/, "the first confirmation");
+				expect(first).toContain(`${SELF}: ${SELF_PIN} -> ${SELF_LATEST}`);
+				expect(first).toContain("after the restart");
+				tui.send("Enter");
+
+				const offer = await tui.waitScreen(/Restart now\?/, "the restart offer");
+				expect(offer).toContain("Restarting keeps this session");
+				expect(await tui.installed(SELF)).toBe(SELF_LATEST);
+				// Left for the next session to take.
+				expect(await exists(tui.markerFile)).toBe(true);
+				tui.send("Enter");
+
+				// The extension in the new process consumed the marker, which is the
+				// proof that omp really restarted; the conversation is the proof that
+				// it came back on the same session.
+				const resumed = await tui.waitScreen(/Update all plugins\?/, "the continued update after the restart");
+				expect(resumed).toContain(`${PACKAGE}: ${PIN} -> ${LATEST}`);
+				expect(resumed).not.toContain(`${SELF}: `);
+				expect(resumed).toContain("hello e2e");
+				expect(await exists(tui.markerFile)).toBe(false);
+				tui.send("Enter");
+
+				await tui.waitScreen(/Restart now\?/, "the second restart offer");
+				expect(await tui.installed(PACKAGE)).toBe(LATEST);
+			} finally {
+				await tui.close();
+			}
+		},
+		400_000,
+	);
+
+	it(
+		"does not offer a restart that would drop an unsaved conversation",
+		async () => {
+			if (!hasTools) {
+				console.warn("skipping omp terminal restart: 'omp' or 'tmux' is not on PATH");
+				return;
+			}
+			// --no-session: the chat lives only in this process, so a restart would
+			// come back empty while the dialog promises the session is kept.
+			const tui = await launch(["--no-session"]);
+			try {
+				await tui.waitScreen(/2 plugin updates available/, "the startup notice");
+				tui.send("hello e2e", "Enter");
+				await tui.waitScreen(/hello e2e/, "the message on screen");
+				await until(() => !/Working/.test(tui.screen()), "the agent to go idle", tui.describeScreen);
+
+				tui.send("/maint-update-all", "Enter");
+				await tui.waitScreen(/Update all plugins\?/, "the confirmation");
+				tui.send("Enter");
+
+				const done = await tui.waitScreen(/Run \/restart to load it/, "the manual restart hint");
+				expect(done).not.toContain("Restart now?");
+				expect(await tui.installed(SELF)).toBe(SELF_LATEST);
+			} finally {
+				await tui.close();
+			}
+		},
+		400_000,
+	);
 });

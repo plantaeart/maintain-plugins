@@ -111,47 +111,60 @@ describe("session-start notice", () => {
 				},
 			);
 
-			const notice = await new Promise<string>((resolve, reject) => {
-				let buffer = "";
-				const timer = setTimeout(() => {
-					child.kill("SIGTERM");
-					reject(new Error("no session-start notice arrived"));
-				}, 60_000);
-				child.stdout.on("data", (chunk: Buffer) => {
-					buffer += chunk.toString();
-					const lines = buffer.split("\n");
-					buffer = lines.pop() ?? "";
-					for (const line of lines) {
-						if (!line.trim()) continue;
-						let frame: { type?: string; method?: string; widgetLines?: string[] };
-						try {
-							frame = JSON.parse(line);
-						} catch {
-							continue;
+			try {
+				const notice = await new Promise<string>((resolve, reject) => {
+					let buffer = "";
+					const timer = setTimeout(() => {
+						child.kill("SIGTERM");
+						reject(new Error("no session-start notice arrived"));
+					}, 60_000);
+					child.stdout.on("data", (chunk: Buffer) => {
+						buffer += chunk.toString();
+						const lines = buffer.split("\n");
+						buffer = lines.pop() ?? "";
+						for (const line of lines) {
+							if (!line.trim()) continue;
+							let frame: { type?: string; method?: string; widgetLines?: string[] };
+							try {
+								frame = JSON.parse(line);
+							} catch {
+								continue;
+							}
+							// The notice is a widget, not a notify: notify("info") lands on
+							// a status line the host replaces, so another plugin notifying at
+							// startup can silently remove this one.
+							if (
+								frame.type === "extension_ui_request" &&
+								frame.method === "setWidget" &&
+								(frame.widgetLines ?? []).some((line) => /plugin update/.test(line))
+							) {
+								clearTimeout(timer);
+								child.kill("SIGTERM");
+								resolve((frame.widgetLines ?? []).join("\n"));
+							}
 						}
-						// The notice is a widget, not a notify: notify("info") lands on
-						// a status line the host replaces, so another plugin notifying at
-						// startup can silently remove this one.
-						if (
-							frame.type === "extension_ui_request" &&
-							frame.method === "setWidget" &&
-							(frame.widgetLines ?? []).some((line) => /plugin update/.test(line))
-						) {
-							clearTimeout(timer);
-							child.kill("SIGTERM");
-							resolve((frame.widgetLines ?? []).join("\n"));
-						}
-					}
+					});
+					child.on("error", reject);
 				});
-				child.on("error", reject);
-			});
 
-			const rows = notice.split("\n").filter((line) => /⬆️ \S+:/.test(line));
-			expect(rows.length).toBe(CAP);
-			// The withheld ones are named in the summary rather than silently dropped.
-			expect(notice).toContain("… and 2 more");
-			expect(notice).not.toContain("⬆️ f:");
-			expect(notice).toContain("Run /maint-updates-check for the full list.");
+				const rows = notice.split("\n").filter((line) => /⬆️ \S+:/.test(line));
+				expect(rows.length).toBe(CAP);
+				// The withheld ones are named in the summary rather than silently dropped.
+				expect(notice).toContain("… and 2 more");
+				expect(notice).not.toContain("⬆️ f:");
+				expect(notice).toContain("Run /maint-updates-check for the full list.");
+			} finally {
+				// Deleted here rather than by the global teardown, which has one 5 s
+				// budget for every sandbox. A host still shutting down writes back
+				// into its HOME, so wait for it to exit first.
+				if (child.exitCode === null && child.signalCode === null) {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					child.once("exit", () => resolve());
+					child.kill("SIGTERM");
+					await promise;
+				}
+				await fs.rm(home, { recursive: true, force: true });
+			}
 		},
 		90_000,
 	);

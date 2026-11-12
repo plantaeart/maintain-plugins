@@ -46,6 +46,7 @@ tests/
   skills/                 # Project-local omp skills (not shipped to npm; see `.npmignore`)
     bump-version/         # Edit `package.json` + annotated git tag (no commit)
     ci-check/             # Full green-pipeline run + skill validation
+    commit/               # One-line commit message + printed commit/push/PR/tag commands
     get-context/          # One-shot project overview
     host-version/         # Compare CI host pins against the latest published release
     release/              # Full publish playbook
@@ -356,7 +357,7 @@ bash .agents/skills/bump-version/scripts/bump-version.sh --minor
 npm publish --access public
 ```
 
-**`.npmignore` keeps the tarball lean.** Without it, `npm pack` falls back to `.gitignore`, which does not exclude `.agents/` or `.github/` — so all seven skills and the workflows would ship. `tests/` and `assets/` stay in: downstream contributors can run `bun test`, and the README image URLs resolve from the tarball.
+**`.npmignore` keeps the tarball lean.** Without it, `npm pack` falls back to `.gitignore`, which does not exclude `.agents/` or `.github/` — so every skill and the workflows would ship. `tests/` and `assets/` stay in so downstream contributors can run `bun test`; `assets/logo/` is dropped because the README and the gallery load logos from GitHub raw URLs.
 
 Smoke test the install:
 

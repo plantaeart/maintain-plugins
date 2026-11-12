@@ -1,17 +1,24 @@
 {
   "name": "maintain-plugins",
-  "version": "0.6.0",
-  "description": "Pi extension that checks installed plugin versions against npm and updates them safely on request",
+  "version": "0.6.1",
+  "description": "Pi and OMP extension that checks installed plugin versions against npm and updates the stale ones safely, in one confirmed step",
   "type": "module",
   "main": "extensions/index.ts",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "omp",
+    "oh-my-pi",
+    "plugin-manager",
+    "plugin-updater",
+    "update-checker"
   ],
   "pi": {
     "extensions": [
       "./extensions"
     ],
-    "image": "./assets/imgs/maint-update-header-image.png"
+    "image": "https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/logo/cover.png"
   },
   "extensions": [
     "./extensions"
@@ -33,5 +40,13 @@
     "oxlint": "^1.85.0",
     "typescript": "^5.7.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plantaeart/maintain-plugins.git"
+  },
+  "homepage": "https://github.com/plantaeart/maintain-plugins#readme",
+  "bugs": {
+    "url": "https://github.com/plantaeart/maintain-plugins/issues"
+  }
 }

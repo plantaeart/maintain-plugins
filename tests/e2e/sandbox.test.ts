@@ -821,11 +821,12 @@ describe("omp terminal restart", () => {
 		tmux(
 			"new-session", "-d", "-s", session, "-x", "150", "-y", "50", "-c", project,
 			[
-				"env", `HOME=${quote(home)}`, `MAINTAIN_PLUGINS_REGISTRY=http://127.0.0.1:${registry.port}`,
+				"env", `HOME=${quote(home)}`, "OMP_SKIP_SETUP=1", `MAINTAIN_PLUGINS_REGISTRY=http://127.0.0.1:${registry.port}`,
 				"omp", "--no-skills", "--no-rules", "--no-extensions", ...extraFlags,
 				"-e", quote(path.join(REPO_ROOT, "extensions/index.ts")),
 			].join(" "),
 		);
+		// OMP_SKIP_SETUP: omp >= 18.19 opens a first-run setup wizard in a fresh HOME.
 		// `env` execs omp, so the pane's process is omp itself, and an in-place
 		// restart keeps that pid.
 		const pid = Number(tmux("display-message", "-p", "-t", session, "#{pane_pid}").trim());

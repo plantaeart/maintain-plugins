@@ -4,7 +4,6 @@ import type {
 	ExtensionContext,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { discoverPlugins } from "../src/core/plugin-registry";
 import { cachePathFor, continuePathFor, detectHost, pluginDirFor } from "../src/core/paths";
 import { RUNNING_VERSION, reloadPending } from "../src/core/self";
@@ -21,6 +20,7 @@ import {
 	ExtensionCommand,
 	ExtensionEventType,
 } from "../src/core/types/extension-command.type";
+import { boxBanner } from "../src/core/banner";
 
 /** Widget slot for the update progress row; cleared when the run ends. */
 const PROGRESS_WIDGET_KEY = "maintain-plugins-progress";
@@ -99,27 +99,6 @@ export default function maintainPluginsExtension(pi: ExtensionAPI): void {
 	/** `⬆️ name: installed -> latest` — shared by the notice and both dialogs. */
 	function staleRow(update: Pick<PluginRecord, "name" | "installed" | "latest">): string {
 		return `⬆️ ${update.name}: ${update.installed} -> ${update.latest}`;
-	}
-
-	/**
-	 * Draw the notice as an open-right box: top rule, left edge, bottom rule.
-	 *
-	 * Deliberately no right border, which means the rows need no padding to line
-	 * up — only the two rules do, and both are drawn to the widest row. A closed
-	 * box would have to pad every row to a common display width, and an emoji
-	 * like ⬆️ occupies one cell while its string is two code points, so a naive
-	 * pad leaves every emoji row a column short.
-	 */
-	function boxBanner(title: string, rows: string[]): string[] {
-		const widest = Math.max(
-			visibleWidth(title) + 4,
-			...rows.map((row) => visibleWidth(row) + 2),
-		);
-		return [
-			`╭─ ${title} ${"─".repeat(Math.max(1, widest - visibleWidth(title) - 4))}`,
-			...rows.map((row) => `│ ${row}`),
-			`╰─${"─".repeat(Math.max(1, widest - 2))}`,
-		];
 	}
 
 	function formatReport({ records: checked, live, checkedAt }: CheckResult): string {

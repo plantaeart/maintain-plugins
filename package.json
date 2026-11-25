@@ -1,6 +1,6 @@
 {
   "name": "maintain-plugins",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Pi and OMP extension that checks installed plugin versions against npm and updates the stale ones safely, in one confirmed step",
   "type": "module",
   "main": "extensions/index.ts",
@@ -31,8 +31,7 @@
     "ci": "bun run lint && bun run typecheck && bun test && bun run validate:skills"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",

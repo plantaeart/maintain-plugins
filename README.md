@@ -12,7 +12,7 @@
 
 A Pi / OMP extension that compares the plugins your host has installed against the npm registry, tells you what moved, and updates the stale ones on request. Works in both Pi and OMP; it resolves the host it is running under and uses that host's own package manager.
 
-![Session-start notice naming stale plugins](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/imgs/maint-update-header-image.png)
+![Session-start notice naming stale plugins](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/imgs/notice.png)
 
 **Contents:** [Install](#install) · [Quick start](#quick-start) · [What it does](#what-it-does) · [Commands](#commands) · [Demos](#demos) · [What is read and written](#what-is-read-and-written) · [Safety notes](#safety-notes) · [Developers](#for-developers)
 
@@ -69,11 +69,23 @@ That's it. The extension registers on next session start. Works in both Pi and O
 
 **`/maint-updates-check`** - a read-only report. Every plugin, its installed and newest version, and whether an update exists. Writes nothing:
 
-![Check installed plugin versions against npm](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/gifs/check.gif)
+![Check installed plugin versions against npm](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/gifs/check.gif?v=0.6.3)
 
 **`/maint-update-all`** - the full update: confirmation, per-plugin progress, install, then the reload offer:
 
-![Update every stale plugin](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/gifs/update.gif)
+![Update every stale plugin](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/gifs/update.gif?v=0.6.3)
+
+The two dialogs of that run, as stills - the confirmation lists every delta before anything is written, and the restart offer names what it would activate:
+
+![Update confirmation listing every version delta](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/imgs/update-confirm.png)
+
+![Restart offer after the update](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/imgs/update-restart.png)
+
+**`/maint-uninstall-plugin`** - pick a plugin, confirm a second time, then the host's own uninstaller removes it:
+
+![Remove an installed plugin](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/gifs/uninstall.gif?v=0.6.3)
+
+![Removal confirmation](https://raw.githubusercontent.com/plantaeart/maintain-plugins/main/assets/imgs/uninstall-confirm.png)
 
 ---
 

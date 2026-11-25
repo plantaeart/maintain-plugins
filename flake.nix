@@ -22,7 +22,7 @@
       # an explicit override (as in system-prompt-switch) if a bun version must be held or is
       # needed before nixpkgs has it.
       devShells = forAllSystems (pkgs: let
-        packages = [ pkgs.bun pkgs.nodejs_26 pkgs.uv ];
+        packages = [ pkgs.bun pkgs.nodejs_26 pkgs.uv (pkgs.python3.withPackages (ps: [ ps.pillow ])) ];
       in {
         # Day-to-day development (direnv): no host CLIs installed.
         default = pkgs.mkShell { inherit packages; };

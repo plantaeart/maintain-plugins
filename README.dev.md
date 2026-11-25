@@ -51,6 +51,7 @@ tests/
     host-version/         # Compare CI host pins against the latest published release
     release/              # Full publish playbook
     sandbox-test/         # Throwaway HOME for testing the extension by hand
+    screenshots/          # Regenerates the README PNGs and GIFs from a real omp (needs network)
     unit-test/            # Test conventions for this repo
 ```
 

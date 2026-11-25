@@ -393,7 +393,7 @@ const DEAD_REGISTRY = { MAINTAIN_PLUGINS_REGISTRY: "http://127.0.0.1:1" };
 /** This plugin's own name, a stale copy of it, and a real published release newer than that. */
 const SELF = "maintain-plugins";
 const SELF_PIN = "0.3.0";
-const SELF_LATEST = "0.4.1";
+const SELF_LATEST = "0.6.2";
 
 /**
  * Pretend a registry check just ran, so the version comparison costs no
